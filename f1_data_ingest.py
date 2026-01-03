@@ -194,6 +194,50 @@ circuit_history = sa.Table(
     sa.UniqueConstraint("circuit_id", "season", name="uq_circuit_history"),
 )
 
+driver_features = sa.Table(
+    "driver_features",
+    metadata,
+    sa.Column("feature_id", sa.Integer, primary_key=True),
+    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
+    sa.Column("driver_id", sa.Integer, sa.ForeignKey("drivers.driver_id"), nullable=False),
+    sa.Column("last_3_races_avg_position", sa.Float),
+    sa.Column("last_5_races_avg_position", sa.Float),
+    sa.Column("last_3_races_points_scored", sa.Float),
+    sa.Column("recent_dnf_rate", sa.Float),
+    sa.Column("recent_qualifying_avg_position", sa.Float),
+    sa.Column("positions_gained_last_3_races", sa.Float),
+    sa.Column("avg_finish_position_at_circuit", sa.Float),
+    sa.Column("best_result_at_circuit", sa.Float),
+    sa.Column("worst_result_at_circuit", sa.Float),
+    sa.Column("qualifying_to_race_conversion_at_circuit", sa.Float),
+    sa.Column("avg_positions_gained_lap1_at_circuit", sa.Float),
+    sa.Column("crash_rate_at_circuit", sa.Float),
+    sa.Column("qualifying_pace_percentile", sa.Float),
+    sa.Column("race_pace_percentile", sa.Float),
+    sa.Column("overtaking_success_rate", sa.Float),
+    sa.Column("defending_success_rate", sa.Float),
+    sa.Column("wet_weather_performance_multiplier", sa.Float),
+    sa.Column("first_lap_position_change_avg", sa.Float),
+    sa.Column("consistency_score", sa.Float),
+    sa.Column("tire_management_score", sa.Float),
+    sa.Column("total_f1_races", sa.Integer),
+    sa.Column("races_at_this_circuit", sa.Integer),
+    sa.Column("years_with_current_team", sa.Integer),
+    sa.Column("championship_experience", sa.Integer),
+    sa.Column("podium_count", sa.Integer),
+    sa.Column("win_count", sa.Integer),
+    sa.Column("qualifying_gap_to_teammate", sa.Float),
+    sa.Column("race_gap_to_teammate", sa.Float),
+    sa.Column("head_to_head_qualifying", sa.Float),
+    sa.Column("head_to_head_race", sa.Float),
+    sa.Column("championship_position", sa.Integer),
+    sa.Column("points_from_leader", sa.Float),
+    sa.Column("contract_year_flag", sa.Boolean),
+    sa.Column("recent_incidents_count", sa.Integer),
+    sa.Column("consecutive_race_finishes", sa.Integer),
+    sa.UniqueConstraint("race_id", "driver_id", name="uq_driver_features"),
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="FastF1 data ingester for PostgreSQL.")
@@ -504,6 +548,7 @@ def build_data_quality_report(conn: sa.Connection) -> Dict[str, Any]:
             "circuits": count(circuits),
             "circuit_characteristics": count(circuit_characteristics),
             "circuit_history": count(circuit_history),
+            "driver_features": count(driver_features),
         },
         "missing_values": {
             "race_results_race_time": null_count(race_results, race_results.c.race_time),
@@ -512,6 +557,9 @@ def build_data_quality_report(conn: sa.Connection) -> Dict[str, Any]:
             "pit_stops_duration": null_count(pit_stops, pit_stops.c.duration),
             "race_weather_air_temp": null_count(race_weather, race_weather.c.air_temp),
             "circuits_circuit_length": null_count(circuits, circuits.c.circuit_length),
+            "driver_features_last_3_avg": null_count(
+                driver_features, driver_features.c.last_3_races_avg_position
+            ),
         },
     }
     return report
@@ -1141,6 +1189,335 @@ def update_circuit_tables(engine: Engine) -> None:
                 conn.execute(history_stmt)
 
 
+def weighted_average(values: List[float], weights: List[float]) -> Optional[float]:
+    if not values or not weights or len(values) != len(weights):
+        return None
+    total_weight = sum(weights)
+    if total_weight == 0:
+        return None
+    return sum(v * w for v, w in zip(values, weights)) / total_weight
+
+
+def exponential_decay_average(values: List[float], decay: float = 0.7) -> Optional[float]:
+    if not values:
+        return None
+    weights = [decay**i for i in range(len(values))]
+    return weighted_average(values, weights)
+
+
+def calculate_driver_features(
+    conn: sa.Connection,
+    driver_id: int,
+    target_race_id: int,
+    lookback_period: int,
+) -> Dict[str, Any]:
+    races_df = pd.read_sql(
+        sa.select(races.c.race_id, races.c.season, races.c.round, races.c.circuit_name),
+        conn,
+    )
+    races_df = races_df.sort_values(["season", "round"]).reset_index(drop=True)
+    races_df["order_index"] = range(len(races_df))
+    results_df = pd.read_sql(
+        sa.select(
+            race_results.c.race_id,
+            race_results.c.driver_id,
+            race_results.c.team_id,
+            race_results.c.grid_position,
+            race_results.c.finishing_position,
+            race_results.c.points,
+            race_results.c.status,
+        ),
+        conn,
+    )
+    qualifying_df = pd.read_sql(
+        sa.select(
+            qualifying_results.c.race_id,
+            qualifying_results.c.driver_id,
+            qualifying_results.c.grid_position.label("qualifying_position"),
+        ),
+        conn,
+    )
+    lap_times_df = pd.read_sql(
+        sa.select(
+            lap_times.c.race_id,
+            lap_times.c.driver_id,
+            lap_times.c.lap_number,
+            lap_times.c.lap_time,
+        ),
+        conn,
+    )
+    weather_df = pd.read_sql(
+        sa.select(
+            race_weather.c.race_id,
+            race_weather.c.conditions,
+            race_weather.c.session_type,
+        ),
+        conn,
+    )
+    target_race = races_df[races_df["race_id"] == target_race_id]
+    if target_race.empty:
+        return {}
+    target_race_row = target_race.iloc[0]
+    target_circuit = target_race_row["circuit_name"]
+    target_season = target_race_row["season"]
+    target_order = target_race_row["order_index"]
+
+    results_df = results_df.merge(races_df, on="race_id", how="left")
+    qualifying_df = qualifying_df.merge(races_df, on="race_id", how="left")
+    lap_times_df = lap_times_df.merge(races_df, on="race_id", how="left")
+    weather_df = weather_df.merge(races_df, on="race_id", how="left")
+
+    driver_results = results_df[results_df["driver_id"] == driver_id].sort_values(
+        ["season", "round"]
+    )
+    driver_results = driver_results[driver_results["order_index"] <= target_order]
+    recent_results = driver_results.tail(lookback_period)
+
+    last_three = recent_results.tail(3)["finishing_position"].dropna().tolist()
+    last_three_avg = weighted_average(last_three[::-1], [0.5, 0.3, 0.2][: len(last_three)])
+
+    last_five = recent_results.tail(5)["finishing_position"].dropna().tolist()
+    last_five_avg = exponential_decay_average(last_five[::-1])
+
+    last_three_points = recent_results.tail(3)["points"].dropna().sum()
+
+    last_ten = recent_results.tail(10)
+    dnf_mask = last_ten["status"].fillna("").str.contains("DNF|DNS|DSQ|Ret", case=False)
+    recent_dnf_rate = dnf_mask.mean() if not last_ten.empty else None
+
+    recent_qualifying = qualifying_df[
+        (qualifying_df["driver_id"] == driver_id) & (qualifying_df["order_index"] <= target_order)
+    ].sort_values(["season", "round"])
+    recent_qualifying_avg = recent_qualifying.tail(10)["qualifying_position"].dropna().mean()
+
+    positions_gained = None
+    if not recent_results.empty:
+        gains = (recent_results["grid_position"] - recent_results["finishing_position"]).dropna()
+        positions_gained = gains.tail(3).mean()
+
+    circuit_results = results_df[
+        (results_df["driver_id"] == driver_id)
+        & (results_df["circuit_name"] == target_circuit)
+        & (results_df["season"] >= target_season - 5)
+        & (results_df["season"] <= target_season)
+    ]
+    avg_finish_circuit = circuit_results["finishing_position"].dropna().mean()
+    best_result = circuit_results["finishing_position"].dropna().min()
+    worst_result = circuit_results["finishing_position"].dropna().max()
+
+    qualifying_conversion = None
+    circuit_qual = qualifying_df[
+        (qualifying_df["driver_id"] == driver_id) & (qualifying_df["circuit_name"] == target_circuit)
+    ]
+    if not circuit_results.empty and not circuit_qual.empty:
+        merged = circuit_results.merge(circuit_qual, on=["race_id", "driver_id"], how="inner")
+        if not merged.empty:
+            qualifying_conversion = (
+                merged["qualifying_position"].dropna().mean() - merged["finishing_position"].dropna().mean()
+            )
+
+    crash_rate = None
+    if not circuit_results.empty:
+        crash_rate = (
+            circuit_results["status"].fillna("").str.contains("Accident|Crash|Collision", case=False).mean()
+        )
+
+    qualifying_pace_percentile = None
+    if not recent_qualifying.empty:
+        recent_qualifying["rank"] = recent_qualifying.groupby("race_id")["qualifying_position"].rank(
+            method="average"
+        )
+        recent_qualifying["field_size"] = recent_qualifying.groupby("race_id")["qualifying_position"].transform(
+            "count"
+        )
+        recent_qualifying["percentile"] = 1 - (
+            (recent_qualifying["rank"] - 1) / (recent_qualifying["field_size"] - 1)
+        )
+        qualifying_pace_percentile = recent_qualifying.tail(lookback_period)["percentile"].mean()
+
+    race_pace_percentile = None
+    if not recent_results.empty:
+        recent_results = recent_results.copy()
+        recent_results["rank"] = recent_results.groupby("race_id")["finishing_position"].rank(
+            method="average"
+        )
+        recent_results["field_size"] = recent_results.groupby("race_id")["finishing_position"].transform("count")
+        recent_results["percentile"] = 1 - (
+            (recent_results["rank"] - 1) / (recent_results["field_size"] - 1)
+        )
+        race_pace_percentile = recent_results["percentile"].mean()
+
+    overtaking_success_rate = None
+    if not recent_results.empty:
+        opportunities = recent_results["grid_position"].dropna() - 1
+        overtakes = (recent_results["grid_position"] - recent_results["finishing_position"]).clip(lower=0)
+        if not opportunities.empty and opportunities.sum() > 0:
+            overtaking_success_rate = (overtakes.sum() / opportunities.sum()).item()
+
+    wet_multiplier = None
+    if not weather_df.empty:
+        wet_races = weather_df[
+            (weather_df["conditions"] == "wet") & (weather_df["session_type"].str.contains("Race", case=False))
+        ]["race_id"].unique()
+        dry_races = weather_df[
+            (weather_df["conditions"] == "dry") & (weather_df["session_type"].str.contains("Race", case=False))
+        ]["race_id"].unique()
+        wet_results = driver_results[driver_results["race_id"].isin(wet_races)]
+        dry_results = driver_results[driver_results["race_id"].isin(dry_races)]
+        if not wet_results.empty and not dry_results.empty:
+            wet_avg = wet_results["finishing_position"].dropna().mean()
+            dry_avg = dry_results["finishing_position"].dropna().mean()
+            if dry_avg and dry_avg > 0:
+                wet_multiplier = wet_avg / dry_avg
+
+    consistency_score = None
+    lap_subset = lap_times_df[
+        (lap_times_df["driver_id"] == driver_id) & (lap_times_df["order_index"] <= target_order)
+    ]
+    lap_subset = lap_subset.dropna(subset=["lap_time"])
+    if not lap_subset.empty:
+        std_dev = lap_subset["lap_time"].std()
+        if std_dev and std_dev > 0:
+            consistency_score = 1 / std_dev
+
+    tire_management_score = None
+    if not lap_subset.empty:
+        degradation_scores = []
+        for _, race_group in lap_subset.groupby("race_id"):
+            race_group = race_group.sort_values("lap_number")
+            if race_group.empty:
+                continue
+            first = race_group["lap_time"].iloc[0]
+            last = race_group["lap_time"].iloc[-1]
+            if first and first > 0:
+                degradation_scores.append((last - first) / first)
+        if degradation_scores:
+            tire_management_score = float(pd.Series(degradation_scores).mean())
+
+    total_f1_races = int(driver_results["race_id"].nunique())
+    races_at_circuit = int(circuit_results["race_id"].nunique())
+    podium_count = int((driver_results["finishing_position"] <= 3).sum())
+    win_count = int((driver_results["finishing_position"] == 1).sum())
+
+    years_with_current_team = None
+    if not driver_results.empty:
+        latest_team = driver_results.iloc[-1]["team_id"]
+        years_with_current_team = driver_results[driver_results["team_id"] == latest_team]["season"].nunique()
+
+    teammate_qual_gap = None
+    teammate_race_gap = None
+    head_to_head_qualifying = None
+    head_to_head_race = None
+    if not driver_results.empty:
+        target_team = driver_results.iloc[-1]["team_id"]
+        team_results = results_df[
+            (results_df["team_id"] == target_team)
+            & (results_df["order_index"] <= target_order)
+        ]
+        teammate_results = team_results[team_results["driver_id"] != driver_id]
+        if not teammate_results.empty:
+            merged = driver_results.merge(
+                teammate_results,
+                on="race_id",
+                suffixes=("_driver", "_mate"),
+            )
+            if not merged.empty:
+                race_gap = merged["finishing_position_driver"] - merged["finishing_position_mate"]
+                teammate_race_gap = race_gap.mean()
+                head_to_head_race = (race_gap < 0).mean()
+            qual_merged = qualifying_df[qualifying_df["driver_id"] == driver_id].merge(
+                qualifying_df[qualifying_df["driver_id"].isin(teammate_results["driver_id"])],
+                on="race_id",
+                suffixes=("_driver", "_mate"),
+            )
+            if not qual_merged.empty:
+                qual_gap = qual_merged["qualifying_position_driver"] - qual_merged["qualifying_position_mate"]
+                teammate_qual_gap = qual_gap.mean()
+                head_to_head_qualifying = (qual_gap < 0).mean()
+
+    recent_incidents = driver_results.tail(5)
+    recent_incidents_count = int(
+        recent_incidents["status"]
+        .fillna("")
+        .str.contains("Accident|Crash|Collision|DNF", case=False)
+        .sum()
+    )
+
+    consecutive_finishes = 0
+    for _, row in driver_results[::-1].iterrows():
+        status = str(row.get("status") or "")
+        if "Finished" in status or row.get("finishing_position"):
+            consecutive_finishes += 1
+        else:
+            break
+
+    return {
+        "last_3_races_avg_position": last_three_avg,
+        "last_5_races_avg_position": last_five_avg,
+        "last_3_races_points_scored": last_three_points,
+        "recent_dnf_rate": recent_dnf_rate,
+        "recent_qualifying_avg_position": recent_qualifying_avg,
+        "positions_gained_last_3_races": positions_gained,
+        "avg_finish_position_at_circuit": avg_finish_circuit,
+        "best_result_at_circuit": best_result,
+        "worst_result_at_circuit": worst_result,
+        "qualifying_to_race_conversion_at_circuit": qualifying_conversion,
+        "avg_positions_gained_lap1_at_circuit": None,
+        "crash_rate_at_circuit": crash_rate,
+        "qualifying_pace_percentile": qualifying_pace_percentile,
+        "race_pace_percentile": race_pace_percentile,
+        "overtaking_success_rate": overtaking_success_rate,
+        "defending_success_rate": None,
+        "wet_weather_performance_multiplier": wet_multiplier,
+        "first_lap_position_change_avg": None,
+        "consistency_score": consistency_score,
+        "tire_management_score": tire_management_score,
+        "total_f1_races": total_f1_races,
+        "races_at_this_circuit": races_at_circuit,
+        "years_with_current_team": years_with_current_team,
+        "championship_experience": None,
+        "podium_count": podium_count,
+        "win_count": win_count,
+        "qualifying_gap_to_teammate": teammate_qual_gap,
+        "race_gap_to_teammate": teammate_race_gap,
+        "head_to_head_qualifying": head_to_head_qualifying,
+        "head_to_head_race": head_to_head_race,
+        "championship_position": None,
+        "points_from_leader": None,
+        "contract_year_flag": None,
+        "recent_incidents_count": recent_incidents_count,
+        "consecutive_race_finishes": consecutive_finishes,
+    }
+
+
+def update_driver_features(engine: Engine, lookback_period: int = 10) -> None:
+    with engine.begin() as conn:
+        races_df = pd.read_sql(
+            sa.select(races.c.race_id, races.c.season, races.c.round).order_by(races.c.season, races.c.round),
+            conn,
+        )
+        results_df = pd.read_sql(
+            sa.select(race_results.c.race_id, race_results.c.driver_id).distinct(),
+            conn,
+        )
+        for race_id in races_df["race_id"].tolist():
+            drivers_in_race = results_df[results_df["race_id"] == race_id]["driver_id"].tolist()
+            for driver_id in drivers_in_race:
+                feature_values = calculate_driver_features(conn, driver_id, race_id, lookback_period)
+                if not feature_values:
+                    continue
+                stmt = pg_insert(driver_features).values(
+                    race_id=race_id,
+                    driver_id=driver_id,
+                    **feature_values,
+                )
+                stmt = stmt.on_conflict_do_update(
+                    constraint="uq_driver_features",
+                    set_=feature_values,
+                )
+                conn.execute(stmt)
+
+
 def main() -> None:
     setup_logging()
     args = parse_args()
@@ -1151,6 +1528,7 @@ def main() -> None:
         LOG.info("Starting ingestion for season %s", season)
         ingest_season(engine, season, args.sleep, args.weather_api_key, args.weather_base_url)
     update_circuit_tables(engine)
+    update_driver_features(engine)
     with engine.begin() as conn:
         report = build_data_quality_report(conn)
     report_path = "data_quality_report.json"
