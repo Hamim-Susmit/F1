@@ -47,6 +47,10 @@ class F1RacePredictor:
             "xgb_podium": joblib.load(os.path.join(model_dir, "xgb_podium.joblib")),
         }
         self.feature_extractor = FeatureExtractor(self.engine)
+        self.weather_override: Dict[str, Any] | None = None
+        self.grid_overrides: Dict[int, int] = {}
+        self.team_performance_overrides: Dict[str, float] = {}
+        self.dnf_overrides: set[int] = set()
 
     def get_race_info(self, race_id: int) -> Dict[str, Any]:
         query = sa.text(
@@ -63,6 +67,8 @@ class F1RacePredictor:
         return dict(row)
 
     def get_weather_forecast(self, race_id: int) -> Dict[str, Any]:
+        if self.weather_override:
+            return dict(self.weather_override)
         forecast_query = sa.text(
             """
             SELECT air_temp, track_temp, rain_probability, rain_amount, humidity,
@@ -144,15 +150,29 @@ class F1RacePredictor:
 
         driver_features: List[Dict[str, Any]] = []
         for driver in entry_list:
+            grid_position = self.grid_overrides.get(
+                driver["driver_id"], driver.get("grid_position")
+            )
             features = self.feature_extractor.extract(
                 driver_id=driver["driver_id"],
                 race_id=race_id,
-                grid_position=driver.get("grid_position"),
+                grid_position=grid_position,
                 use_latest_data=use_latest_data,
             )
             driver_features.append(features)
 
         X = pd.DataFrame(driver_features).fillna(0)
+        if "wet_race_probability" in X.columns and weather_forecast.get("rain_probability") is not None:
+            X["wet_race_probability"] = weather_forecast["rain_probability"]
+        if "weather_change_during_race_probability" in X.columns and weather_forecast.get("rain_probability") is not None:
+            X["weather_change_during_race_probability"] = min(
+                1.0, float(weather_forecast["rain_probability"]) * 1.2
+            )
+        if self.team_performance_overrides and "team_performance_score" in X.columns:
+            for idx, driver in enumerate(entry_list):
+                team_name = driver.get("team_name")
+                if team_name in self.team_performance_overrides:
+                    X.loc[idx, "team_performance_score"] = self.team_performance_overrides[team_name]
 
         predictions = {
             "position": self.models["xgb_position"].predict(X),
@@ -162,6 +182,10 @@ class F1RacePredictor:
             "rf_position": self.models["rf_position"].predict(X),
             "nn_position": self.models["nn_position"].predict(X, verbose=0).ravel(),
         }
+        if self.dnf_overrides:
+            for idx, driver in enumerate(entry_list):
+                if driver["driver_id"] in self.dnf_overrides:
+                    predictions["dnf_probability"][idx] = 1.0
 
         final_position = (
             predictions["position"] * 0.35
@@ -171,6 +195,10 @@ class F1RacePredictor:
         )
 
         final_position = self.resolve_position_conflicts(final_position)
+        if self.dnf_overrides:
+            for idx, driver in enumerate(entry_list):
+                if driver["driver_id"] in self.dnf_overrides:
+                    final_position[idx] = 20
         confidence = self.calculate_confidence(predictions)
         explanations = self.explain_predictions(X, entry_list)
 
@@ -386,3 +414,127 @@ class LivePredictionUpdater:
         marker = os.path.join(self.predictor.model_dir, "last_retrain_marker.txt")
         with open(marker, "w", encoding="utf-8") as handle:
             handle.write("0")
+
+
+class ScenarioSimulator:
+    def __init__(self, predictor: F1RacePredictor) -> None:
+        self.predictor = predictor
+
+    def simulate_weather_scenarios(self, race_id: int) -> Dict[str, Any]:
+        scenarios = {
+            "dry": {"rain_probability": 0.0, "temp": 25},
+            "mixed": {"rain_probability": 0.3, "temp": 22},
+            "wet": {"rain_probability": 0.8, "temp": 18},
+            "very_wet": {"rain_probability": 1.0, "temp": 16},
+        }
+        results = {}
+        for scenario_name, weather in scenarios.items():
+            self.predictor.weather_override = weather
+            pred = self.predictor.predict_race(race_id)
+            results[scenario_name] = pred["predictions"]
+        self.predictor.weather_override = None
+        return self.compare_scenarios(results)
+
+    def simulate_grid_penalty(
+        self, race_id: int, driver_id: int, penalty_positions: int
+    ) -> Dict[str, Any]:
+        base_pred = self.predictor.predict_race(race_id)
+        entry_list = self.predictor.get_entry_list(race_id)
+        entry = next((driver for driver in entry_list if driver["driver_id"] == driver_id), None)
+        if entry and entry.get("grid_position") is not None:
+            current_grid = entry["grid_position"]
+            self.predictor.grid_overrides[driver_id] = min(
+                20, current_grid + penalty_positions
+            )
+        penalty_pred = self.predictor.predict_race(race_id)
+        self.predictor.grid_overrides.pop(driver_id, None)
+        return self.compare_predictions(base_pred, penalty_pred)
+
+    def simulate_dnf(self, race_id: int, driver_ids: List[int]) -> Dict[str, Any]:
+        base_pred = self.predictor.predict_race(race_id)
+        self.predictor.dnf_overrides = set(driver_ids)
+        dnf_pred = self.predictor.predict_race(race_id)
+        self.predictor.dnf_overrides = set()
+        return self.compare_predictions(base_pred, dnf_pred)
+
+    def simulate_team_upgrade(
+        self, race_id: int, team_name: str, performance_boost: float
+    ) -> Dict[str, Any]:
+        base_pred = self.predictor.predict_race(race_id)
+        self.predictor.team_performance_overrides[team_name] = performance_boost
+        upgraded_pred = self.predictor.predict_race(race_id)
+        self.predictor.team_performance_overrides.pop(team_name, None)
+        return self.compare_predictions(base_pred, upgraded_pred)
+
+    def monte_carlo_simulation(self, race_id: int, n_simulations: int = 1000) -> Dict[str, Any]:
+        base_pred = self.predictor.predict_race(race_id)
+        results = {pred["driver"]: [] for pred in base_pred["predictions"]}
+        for _ in range(n_simulations):
+            sim_result = self.simulate_single_race(base_pred)
+            for driver, position in sim_result.items():
+                results[driver].append(position)
+        predictions = {}
+        for driver, positions in results.items():
+            positions_arr = np.array(positions)
+            predictions[driver] = {
+                "mean_position": float(np.mean(positions_arr)),
+                "median_position": float(np.median(positions_arr)),
+                "p10_position": float(np.percentile(positions_arr, 10)),
+                "p90_position": float(np.percentile(positions_arr, 90)),
+                "win_probability": float(np.mean(positions_arr == 1)),
+                "podium_probability": float(np.mean(positions_arr <= 3)),
+                "points_probability": float(np.mean(positions_arr <= 10)),
+            }
+        return predictions
+
+    def simulate_single_race(self, base_pred: Dict[str, Any]) -> Dict[str, int]:
+        predictions = base_pred["predictions"]
+        simulated = {}
+        for pred in predictions:
+            noise = np.random.normal(0, 1.5)
+            dnf_roll = np.random.rand() < pred["dnf_probability"]
+            if dnf_roll:
+                simulated[pred["driver"]] = 20
+            else:
+                simulated[pred["driver"]] = int(
+                    np.clip(round(pred["position"] + noise), 1, 20)
+                )
+        # Resolve collisions
+        final_positions = self.resolve_conflicts(simulated)
+        return final_positions
+
+    def resolve_conflicts(self, positions: Dict[str, int]) -> Dict[str, int]:
+        assigned = {}
+        used = set()
+        for driver, pos in sorted(positions.items(), key=lambda x: x[1]):
+            final_pos = pos
+            if final_pos in used:
+                available = [p for p in range(1, 21) if p not in used]
+                if available:
+                    final_pos = min(available, key=lambda x: abs(x - pos))
+            used.add(final_pos)
+            assigned[driver] = final_pos
+        return assigned
+
+    def compare_predictions(
+        self, base_pred: Dict[str, Any], scenario_pred: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        base_map = {p["driver"]: p["position"] for p in base_pred["predictions"]}
+        scenario_map = {p["driver"]: p["position"] for p in scenario_pred["predictions"]}
+        changes = {
+            driver: scenario_map[driver] - base_map.get(driver, scenario_map[driver])
+            for driver in scenario_map
+        }
+        return {"base": base_pred, "scenario": scenario_pred, "delta": changes}
+
+    def compare_scenarios(self, results: Dict[str, Any]) -> Dict[str, Any]:
+        drivers = {pred["driver"] for preds in results.values() for pred in preds}
+        comparison = {}
+        for driver in drivers:
+            comparison[driver] = {
+                scenario: next(
+                    (pred["position"] for pred in preds if pred["driver"] == driver), None
+                )
+                for scenario, preds in results.items()
+            }
+        return comparison
