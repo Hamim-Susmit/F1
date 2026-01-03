@@ -11,6 +11,9 @@ import shap
 import sqlalchemy as sa
 import xgboost as xgb
 import lightgbm as lgb
+import tensorflow as tf
+from tensorflow import keras
+from keras import layers
 from sklearn.metrics import mean_absolute_error, mean_squared_error, roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
@@ -33,6 +36,7 @@ def setup_logging() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s - %(message)s",
     )
+    tf.get_logger().setLevel("ERROR")
 
 
 def get_engine(database_url: str) -> sa.Engine:
@@ -190,6 +194,18 @@ def train_lgb_time(X: pd.DataFrame, y: pd.Series, params: Dict) -> lgb.LGBMRegre
     return model
 
 
+def train_lgb_position(X: pd.DataFrame, y: pd.Series, params: Dict) -> lgb.LGBMRegressor:
+    model = lgb.LGBMRegressor(**params)
+    model.fit(X, y)
+    return model
+
+
+def train_xgb_time(X: pd.DataFrame, y: pd.Series, params: Dict) -> xgb.XGBRegressor:
+    model = xgb.XGBRegressor(**params)
+    model.fit(X, y)
+    return model
+
+
 def train_xgb_dnf(X: pd.DataFrame, y: pd.Series) -> xgb.XGBClassifier:
     params = {
         "objective": "binary:logistic",
@@ -212,6 +228,117 @@ def train_xgb_podium(X: pd.DataFrame, y: pd.Series) -> xgb.XGBClassifier:
     }
     model = xgb.XGBClassifier(**params)
     model.fit(X, y)
+    return model
+
+
+def build_f1_neural_network(input_dim: int) -> keras.Model:
+    model = keras.Sequential(
+        [
+            layers.Input(shape=(input_dim,)),
+            layers.Dense(256, activation="relu", kernel_regularizer="l2"),
+            layers.BatchNormalization(),
+            layers.Dropout(0.3),
+            layers.Dense(128, activation="relu", kernel_regularizer="l2"),
+            layers.BatchNormalization(),
+            layers.Dropout(0.3),
+            layers.Dense(64, activation="relu", kernel_regularizer="l2"),
+            layers.BatchNormalization(),
+            layers.Dropout(0.2),
+            layers.Dense(32, activation="relu"),
+            layers.Dense(1, activation="linear"),
+        ]
+    )
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=0.001),
+        loss="mse",
+        metrics=["mae", "mape"],
+    )
+    return model
+
+
+def build_position_distribution_network(input_dim: int, num_classes: int = 20) -> keras.Model:
+    model = keras.Sequential(
+        [
+            layers.Input(shape=(input_dim,)),
+            layers.Dense(256, activation="relu", kernel_regularizer="l2"),
+            layers.BatchNormalization(),
+            layers.Dropout(0.3),
+            layers.Dense(128, activation="relu", kernel_regularizer="l2"),
+            layers.BatchNormalization(),
+            layers.Dropout(0.3),
+            layers.Dense(64, activation="relu"),
+            layers.Dense(num_classes, activation="softmax"),
+        ]
+    )
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=0.001),
+        loss="categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+    return model
+
+
+def train_neural_network(
+    X: pd.DataFrame,
+    y: pd.Series,
+    model_dir: str,
+    name: str,
+) -> keras.Model:
+    tf.random.set_seed(42)
+    model = build_f1_neural_network(X.shape[1])
+    early_stopping = keras.callbacks.EarlyStopping(
+        monitor="val_loss",
+        patience=20,
+        restore_best_weights=True,
+    )
+    reduce_lr = keras.callbacks.ReduceLROnPlateau(
+        monitor="val_loss",
+        factor=0.5,
+        patience=10,
+        min_lr=1e-6,
+    )
+    model.fit(
+        X,
+        y,
+        validation_split=0.15,
+        epochs=200,
+        batch_size=64,
+        callbacks=[early_stopping, reduce_lr],
+        verbose=0,
+    )
+    model.save(os.path.join(model_dir, f"{name}.keras"))
+    return model
+
+
+def train_position_distribution_network(
+    X: pd.DataFrame,
+    y: pd.Series,
+    model_dir: str,
+) -> keras.Model:
+    tf.random.set_seed(42)
+    y_onehot = keras.utils.to_categorical(y.clip(lower=1) - 1, num_classes=20)
+    model = build_position_distribution_network(X.shape[1])
+    early_stopping = keras.callbacks.EarlyStopping(
+        monitor="val_loss",
+        patience=20,
+        restore_best_weights=True,
+    )
+    reduce_lr = keras.callbacks.ReduceLROnPlateau(
+        monitor="val_loss",
+        factor=0.5,
+        patience=10,
+        min_lr=1e-6,
+    )
+    model.fit(
+        X,
+        y_onehot,
+        validation_split=0.15,
+        epochs=200,
+        batch_size=64,
+        callbacks=[early_stopping, reduce_lr],
+        verbose=0,
+    )
+    model.save(os.path.join(model_dir, "nn_position_distribution.keras"))
     return model
 
 
@@ -267,14 +394,21 @@ def evaluate_models(
 
     position_model = train_xgb_position(X, y_position, xgb_params)
     time_model = train_lgb_time(X, y_time, lgb_params)
+    lgb_position_model = train_lgb_position(X, y_position, lgb_params)
+    xgb_time_model = train_xgb_time(X, y_time, xgb_params)
     dnf_model = train_xgb_dnf(X, y_dnf)
     podium_model = train_xgb_podium(X, y_podium)
     rf_position_model = train_rf_regressor(X, y_position)
     rf_time_model = train_rf_regressor(X, y_time)
     rf_winner_model = train_rf_classifier(X, y_winner)
+    nn_position_model = train_neural_network(X, y_position, model_dir, "nn_position")
+    nn_time_model = train_neural_network(X, y_time, model_dir, "nn_time")
+    train_position_distribution_network(X, y_position, model_dir)
 
     joblib.dump(position_model, os.path.join(model_dir, "xgb_position.joblib"))
     joblib.dump(time_model, os.path.join(model_dir, "lgb_time.joblib"))
+    joblib.dump(lgb_position_model, os.path.join(model_dir, "lgb_position.joblib"))
+    joblib.dump(xgb_time_model, os.path.join(model_dir, "xgb_time.joblib"))
     joblib.dump(dnf_model, os.path.join(model_dir, "xgb_dnf.joblib"))
     joblib.dump(podium_model, os.path.join(model_dir, "xgb_podium.joblib"))
     joblib.dump(rf_position_model, os.path.join(model_dir, "rf_position.joblib"))
@@ -283,11 +417,15 @@ def evaluate_models(
 
     position_preds = position_model.predict(X)
     time_preds = time_model.predict(X)
+    lgb_position_preds = lgb_position_model.predict(X)
+    xgb_time_preds = xgb_time_model.predict(X)
     dnf_preds = dnf_model.predict_proba(X)[:, 1]
     podium_preds = podium_model.predict_proba(X)
     rf_position_preds = rf_position_model.predict(X)
     rf_time_preds = rf_time_model.predict(X)
     rf_winner_preds = rf_winner_model.predict_proba(X)[:, 1]
+    nn_position_preds = nn_position_model.predict(X, verbose=0).ravel()
+    nn_time_preds = nn_time_model.predict(X, verbose=0).ravel()
 
     LOG.info("Position RMSE: %.3f", mean_squared_error(y_position, position_preds, squared=False))
     LOG.info("Time MAE: %.3f", mean_absolute_error(y_time, time_preds))
@@ -296,9 +434,21 @@ def evaluate_models(
     LOG.info("RF Position RMSE: %.3f", mean_squared_error(y_position, rf_position_preds, squared=False))
     LOG.info("RF Time MAE: %.3f", mean_absolute_error(y_time, rf_time_preds))
     LOG.info("RF Winner ROC-AUC: %.3f", roc_auc_score(y_winner, rf_winner_preds))
+    LOG.info("NN Position RMSE: %.3f", mean_squared_error(y_position, nn_position_preds, squared=False))
+    LOG.info("NN Time MAE: %.3f", mean_absolute_error(y_time, nn_time_preds))
 
-    ensemble_position = 0.35 * position_preds + 0.25 * rf_position_preds
-    ensemble_time = 0.30 * time_preds + 0.25 * rf_time_preds
+    ensemble_position = (
+        0.35 * position_preds
+        + 0.30 * lgb_position_preds
+        + 0.25 * rf_position_preds
+        + 0.10 * nn_position_preds
+    )
+    ensemble_time = (
+        0.35 * xgb_time_preds
+        + 0.30 * time_preds
+        + 0.25 * rf_time_preds
+        + 0.10 * nn_time_preds
+    )
     LOG.info("Ensemble Position RMSE: %.3f", mean_squared_error(y_position, ensemble_position, squared=False))
     LOG.info("Ensemble Time MAE: %.3f", mean_absolute_error(y_time, ensemble_time))
 
