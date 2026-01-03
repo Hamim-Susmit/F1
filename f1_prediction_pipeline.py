@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 import os
 from typing import Any, Dict, List
 
@@ -12,6 +13,7 @@ import sqlalchemy as sa
 from tensorflow import keras
 from scipy.stats import spearmanr
 from sklearn.metrics import accuracy_score, brier_score_loss
+from scipy.stats import ks_2samp
 
 from f1_data_ingest import extract_race_features
 
@@ -638,3 +640,102 @@ class ModelEvaluator:
             ),
             "total_races": len(season_metrics),
         }
+
+
+class ModelMonitor:
+    def __init__(self, model_dir: str = "models") -> None:
+        self.model_dir = model_dir
+        self.baseline_performance = self.load_baseline()
+        self.alert_thresholds = {
+            "winner_accuracy_drop": 0.15,
+            "mae_increase": 1.0,
+            "confidence_calibration_error": 0.2,
+        }
+
+    def load_baseline(self) -> Dict[str, float]:
+        baseline_path = os.path.join(self.model_dir, "baseline_performance.json")
+        if not os.path.exists(baseline_path):
+            return {
+                "winner_accuracy": 0.0,
+                "avg_position_mae": 0.0,
+                "brier_score": 0.0,
+            }
+        with open(baseline_path, "r", encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def check_model_health(self, recent_metrics: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+        alerts: List[Dict[str, str]] = []
+        if not recent_metrics:
+            return alerts
+
+        recent_window = recent_metrics[-5:]
+        current_winner_acc = float(np.mean([m["winner_correct"] for m in recent_window]))
+        baseline_winner_acc = float(self.baseline_performance.get("winner_accuracy", 0.0))
+
+        if current_winner_acc < baseline_winner_acc - self.alert_thresholds["winner_accuracy_drop"]:
+            alerts.append(
+                {
+                    "severity": "HIGH",
+                    "message": f"Winner prediction accuracy dropped to {current_winner_acc:.1%}",
+                    "action": "Consider retraining model or checking data quality",
+                }
+            )
+
+        mae_recent = float(np.mean([m["position_mae"] for m in recent_window]))
+        baseline_mae = float(self.baseline_performance.get("avg_position_mae", 0.0))
+        if mae_recent > baseline_mae + self.alert_thresholds["mae_increase"]:
+            alerts.append(
+                {
+                    "severity": "MEDIUM",
+                    "message": f"Position MAE increased to {mae_recent:.2f}",
+                    "action": "Review feature drift and retrain models",
+                }
+            )
+
+        drift_score = self.calculate_drift(recent_metrics)
+        if drift_score > 0.7:
+            alerts.append(
+                {
+                    "severity": "MEDIUM",
+                    "message": f"Concept drift detected (score: {drift_score:.2f})",
+                    "action": "Retrain with more recent data, adjust feature weights",
+                }
+            )
+
+        calibration_error = self.check_calibration(recent_metrics)
+        if calibration_error > self.alert_thresholds["confidence_calibration_error"]:
+            alerts.append(
+                {
+                    "severity": "LOW",
+                    "message": "Confidence scores not well calibrated",
+                    "action": "Recalibrate confidence estimation",
+                }
+            )
+
+        return alerts
+
+    def calculate_drift(self, recent_metrics: List[Dict[str, Any]]) -> float:
+        drift_values = []
+        for metric in recent_metrics:
+            if "feature_drift" in metric:
+                drift_values.append(metric["feature_drift"])
+            elif "baseline_feature_sample" in metric and "recent_feature_sample" in metric:
+                baseline = np.array(metric["baseline_feature_sample"])
+                recent = np.array(metric["recent_feature_sample"])
+                if baseline.size and recent.size:
+                    drift_values.append(ks_2samp(baseline, recent).statistic)
+        if drift_values:
+            return float(np.mean(drift_values))
+        return 0.0
+
+    def check_calibration(self, recent_metrics: List[Dict[str, Any]]) -> float:
+        brier_scores = [m.get("brier_score", 0.0) for m in recent_metrics if m.get("brier_score") is not None]
+        if not brier_scores:
+            return 0.0
+        baseline_brier = float(self.baseline_performance.get("brier_score", 0.0))
+        return float(np.mean(brier_scores) - baseline_brier)
+
+    def trigger_automated_retraining(self) -> None:
+        marker = os.path.join(self.model_dir, "auto_retrain_requested.txt")
+        with open(marker, "w", encoding="utf-8") as handle:
+            handle.write(datetime.now(timezone.utc).isoformat())
