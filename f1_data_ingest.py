@@ -270,6 +270,47 @@ team_features = sa.Table(
     sa.UniqueConstraint("race_id", "team_id", name="uq_team_features"),
 )
 
+situational_features = sa.Table(
+    "situational_features",
+    metadata,
+    sa.Column("feature_id", sa.Integer, primary_key=True),
+    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
+    sa.Column("driver_id", sa.Integer, sa.ForeignKey("drivers.driver_id"), nullable=False),
+    sa.Column("grid_position", sa.Integer),
+    sa.Column("starting_tire_compound", sa.String),
+    sa.Column("grid_side", sa.String),
+    sa.Column("positions_historically_gained_from_this_grid", sa.Float),
+    sa.Column("expected_lap1_position", sa.Float),
+    sa.Column("optimal_tire_strategy", sa.String),
+    sa.Column("tire_compound_advantage", sa.Float),
+    sa.Column("pit_window_overlap_count", sa.Integer),
+    sa.Column("undercut_opportunity_score", sa.Float),
+    sa.Column("overcut_opportunity_score", sa.Float),
+    sa.Column("strategic_position_value", sa.Float),
+    sa.Column("championship_position", sa.Integer),
+    sa.Column("points_gap_to_next", sa.Float),
+    sa.Column("points_gap_to_previous", sa.Float),
+    sa.Column("mathematical_championship_possible", sa.Boolean),
+    sa.Column("must_win_race_flag", sa.Boolean),
+    sa.Column("team_orders_risk_score", sa.Float),
+    sa.Column("first_lap_incident_probability", sa.Float),
+    sa.Column("safety_car_probability", sa.Float),
+    sa.Column("red_flag_probability", sa.Float),
+    sa.Column("expected_dnf_rate", sa.Float),
+    sa.Column("wet_race_probability", sa.Float),
+    sa.Column("weather_change_during_race_probability", sa.Float),
+    sa.Column("driver_wet_weather_advantage", sa.Float),
+    sa.Column("team_wet_setup_effectiveness", sa.Float),
+    sa.Column("grid_position_std_dev", sa.Float),
+    sa.Column("expected_race_pace_gaps", sa.Float),
+    sa.Column("competitive_balance_index", sa.Float),
+    sa.Column("active_aero_adaptation_score", sa.Float),
+    sa.Column("overtake_mode_efficiency", sa.Float),
+    sa.Column("new_power_unit_reliability_risk", sa.Float),
+    sa.Column("regulation_adaptation_success", sa.Float),
+    sa.UniqueConstraint("race_id", "driver_id", name="uq_situational_features"),
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="FastF1 data ingester for PostgreSQL.")
@@ -582,6 +623,7 @@ def build_data_quality_report(conn: sa.Connection) -> Dict[str, Any]:
             "circuit_history": count(circuit_history),
             "driver_features": count(driver_features),
             "team_features": count(team_features),
+            "situational_features": count(situational_features),
         },
         "missing_values": {
             "race_results_race_time": null_count(race_results, race_results.c.race_time),
@@ -595,6 +637,9 @@ def build_data_quality_report(conn: sa.Connection) -> Dict[str, Any]:
             ),
             "team_features_momentum": null_count(
                 team_features, team_features.c.momentum_score
+            ),
+            "situational_features_grid_position": null_count(
+                situational_features, situational_features.c.grid_position
             ),
         },
     }
@@ -939,6 +984,14 @@ def build_circuit_metrics(
             lap_times.c.driver_id,
             lap_times.c.lap_number,
             lap_times.c.lap_time,
+        ),
+        conn,
+    )
+    pit_df = pd.read_sql(
+        sa.select(
+            pit_stops.c.race_id,
+            pit_stops.c.driver_id,
+            pit_stops.c.stop_number,
         ),
         conn,
     )
@@ -1807,6 +1860,335 @@ def update_team_features(engine: Engine, lookback_period: int = 10) -> None:
                 conn.execute(stmt)
 
 
+def extract_race_features(conn: sa.Connection, race_id: int, driver_id: int) -> Dict[str, Any]:
+    races_df = pd.read_sql(
+        sa.select(races.c.race_id, races.c.season, races.c.round, races.c.circuit_name),
+        conn,
+    )
+    races_df = races_df.sort_values(["season", "round"]).reset_index(drop=True)
+    races_df["order_index"] = range(len(races_df))
+    results_df = pd.read_sql(
+        sa.select(
+            race_results.c.race_id,
+            race_results.c.driver_id,
+            race_results.c.team_id,
+            race_results.c.grid_position,
+            race_results.c.finishing_position,
+            race_results.c.points,
+            race_results.c.status,
+        ),
+        conn,
+    )
+    qualifying_df = pd.read_sql(
+        sa.select(
+            qualifying_results.c.race_id,
+            qualifying_results.c.driver_id,
+            qualifying_results.c.grid_position.label("qualifying_position"),
+        ),
+        conn,
+    )
+    laps_df = pd.read_sql(
+        sa.select(
+            lap_times.c.race_id,
+            lap_times.c.driver_id,
+            lap_times.c.lap_number,
+            lap_times.c.lap_time,
+            lap_times.c.tire_compound,
+        ),
+        conn,
+    )
+    weather_df = pd.read_sql(
+        sa.select(
+            race_weather.c.race_id,
+            race_weather.c.conditions,
+            race_weather.c.wet_race_probability,
+            race_weather.c.weather_change_probability,
+        ),
+        conn,
+    )
+    circuit_char_df = pd.read_sql(
+        sa.select(
+            circuits.c.circuit_id,
+            circuits.c.circuit_name,
+            circuit_characteristics.c.safety_car_probability,
+        ).select_from(
+            circuits.join(circuit_characteristics, circuits.c.circuit_id == circuit_characteristics.c.circuit_id, isouter=True)
+        ),
+        conn,
+    )
+    circuit_history_df = pd.read_sql(
+        sa.select(
+            circuits.c.circuit_name,
+            circuit_history.c.season,
+            circuit_history.c.red_flag_count,
+        ).select_from(
+            circuits.join(circuit_history, circuits.c.circuit_id == circuit_history.c.circuit_id, isouter=True)
+        ),
+        conn,
+    )
+    team_features_df = pd.read_sql(
+        sa.select(
+            team_features.c.race_id,
+            team_features.c.team_id,
+            team_features.c.momentum_score,
+            team_features.c.performance_trend_last_5_races,
+        ),
+        conn,
+    )
+    driver_features_df = pd.read_sql(
+        sa.select(
+            driver_features.c.race_id,
+            driver_features.c.driver_id,
+            driver_features.c.recent_dnf_rate,
+            driver_features.c.wet_weather_performance_multiplier,
+        ),
+        conn,
+    )
+
+    if race_id not in races_df["race_id"].values:
+        return {}
+    race_row = races_df[races_df["race_id"] == race_id].iloc[0]
+    order_index = race_row["order_index"]
+    circuit_name = race_row["circuit_name"]
+    season = race_row["season"]
+
+    results_df = results_df.merge(races_df, on="race_id", how="left")
+    qualifying_df = qualifying_df.merge(races_df, on="race_id", how="left")
+    laps_df = laps_df.merge(races_df, on="race_id", how="left")
+
+    driver_result = results_df[(results_df["race_id"] == race_id) & (results_df["driver_id"] == driver_id)]
+    if driver_result.empty:
+        return {}
+    driver_result = driver_result.iloc[0]
+    team_id = driver_result["team_id"]
+
+    grid_position = driver_result.get("grid_position")
+    grid_side = None
+    if pd.notna(grid_position):
+        grid_side = "clean" if int(grid_position) % 2 == 1 else "dirty"
+
+    starting_tire = None
+    driver_lap1 = laps_df[
+        (laps_df["race_id"] == race_id)
+        & (laps_df["driver_id"] == driver_id)
+        & (laps_df["lap_number"] == 1)
+    ]
+    if not driver_lap1.empty:
+        starting_tire = driver_lap1.iloc[0].get("tire_compound")
+
+    positions_historically_gained = None
+    if pd.notna(grid_position):
+        historical = results_df[
+            (results_df["circuit_name"] == circuit_name)
+            & (results_df["grid_position"] == grid_position)
+        ]
+        if not historical.empty:
+            positions_historically_gained = (
+                historical["grid_position"] - historical["finishing_position"]
+            ).dropna().mean()
+
+    expected_lap1_position = None
+    lap1_times = laps_df[(laps_df["race_id"] == race_id) & (laps_df["lap_number"] == 1)].dropna(subset=["lap_time"])
+    if not lap1_times.empty:
+        lap1_times = lap1_times.sort_values("lap_time")
+        lap1_times["lap1_position"] = range(1, len(lap1_times) + 1)
+        driver_lap1_row = lap1_times[lap1_times["driver_id"] == driver_id]
+        if not driver_lap1_row.empty:
+            expected_lap1_position = driver_lap1_row.iloc[0]["lap1_position"]
+
+    optimal_tire_strategy = None
+    pit_counts = pit_df[pit_df["race_id"] == race_id]
+    if not pit_counts.empty:
+        pit_count = pit_counts[pit_counts["driver_id"] == driver_id]["stop_number"].max()
+        if pd.notna(pit_count):
+            if pit_count <= 1:
+                optimal_tire_strategy = "1-stop"
+            elif pit_count == 2:
+                optimal_tire_strategy = "2-stop"
+            else:
+                optimal_tire_strategy = "3-stop"
+
+    tire_compound_advantage = None
+    if starting_tire:
+        compound_counts = laps_df[(laps_df["race_id"] == race_id) & (laps_df["lap_number"] == 1)]["tire_compound"]
+        if not compound_counts.empty:
+            total = compound_counts.count()
+            same = (compound_counts == starting_tire).sum()
+            tire_compound_advantage = 1 - (same / total) if total else None
+
+    pit_window_overlap_count = None
+    if pd.notna(grid_position):
+        pit_window_overlap_count = results_df[
+            (results_df["race_id"] == race_id)
+            & (results_df["grid_position"] >= grid_position - 2)
+            & (results_df["grid_position"] <= grid_position + 2)
+        ].shape[0]
+
+    undercut_opportunity = None
+    overcut_opportunity = None
+    strategic_position_value = None
+    if pd.notna(grid_position) and pd.notna(driver_result.get("finishing_position")):
+        position_gain = driver_result["grid_position"] - driver_result["finishing_position"]
+        undercut_opportunity = max(0.0, position_gain / 5.0)
+        overcut_opportunity = max(0.0, -position_gain / 5.0)
+        strategic_position_value = position_gain
+
+    championship_position = None
+    points_gap_next = None
+    points_gap_prev = None
+    mathematical_possible = None
+    must_win = None
+    standings = (
+        results_df[results_df["order_index"] <= order_index]
+        .groupby("driver_id")["points"].sum()
+        .sort_values(ascending=False)
+    )
+    if driver_id in standings.index:
+        championship_position = int(standings.index.get_loc(driver_id) + 1)
+        driver_points = standings.loc[driver_id]
+        if championship_position > 1:
+            points_gap_prev = standings.iloc[championship_position - 2] - driver_points
+        if championship_position < len(standings):
+            points_gap_next = driver_points - standings.iloc[championship_position]
+        remaining_races = results_df["race_id"].nunique() - (order_index + 1)
+        max_points_possible = remaining_races * 26
+        leader_points = standings.iloc[0]
+        mathematical_possible = (leader_points - driver_points) <= max_points_possible
+        must_win = (
+            (leader_points - driver_points) > max(0, (remaining_races - 1) * 26)
+            if remaining_races > 0
+            else False
+        )
+
+    team_orders_risk = None
+    if team_id:
+        team_points = (
+            results_df[(results_df["team_id"] == team_id) & (results_df["order_index"] <= order_index)]
+            .groupby("driver_id")["points"]
+            .sum()
+        )
+        if len(team_points) == 2:
+            diff = abs(team_points.iloc[0] - team_points.iloc[1])
+            team_orders_risk = max(0.0, 1 - diff / 50)
+
+    circuit_char_row = circuit_char_df[circuit_char_df["circuit_name"] == circuit_name]
+    safety_car_prob = circuit_char_row["safety_car_probability"].iloc[0] if not circuit_char_row.empty else None
+    circuit_history_row = circuit_history_df[
+        (circuit_history_df["circuit_name"] == circuit_name) & (circuit_history_df["season"] == season)
+    ]
+    red_flag_prob = None
+    if not circuit_history_row.empty:
+        red_flag_prob = min(1.0, circuit_history_row["red_flag_count"].iloc[0] / 5.0)
+
+    driver_feature_row = driver_features_df[
+        (driver_features_df["race_id"] == race_id) & (driver_features_df["driver_id"] == driver_id)
+    ]
+    expected_dnf_rate = driver_feature_row["recent_dnf_rate"].iloc[0] if not driver_feature_row.empty else None
+
+    weather_race = weather_df[weather_df["race_id"] == race_id]
+    wet_race_prob = None
+    weather_change_prob = None
+    if not weather_race.empty:
+        wet_race_prob = weather_race["wet_race_probability"].dropna().mean()
+        weather_change_prob = weather_race["weather_change_probability"].dropna().mean()
+
+    driver_wet_adv = None
+    if not driver_feature_row.empty and wet_race_prob is not None:
+        multiplier = driver_feature_row["wet_weather_performance_multiplier"].iloc[0]
+        if multiplier is not None:
+            driver_wet_adv = multiplier * wet_race_prob
+
+    team_wet_setup = None
+    team_feature_row = team_features_df[
+        (team_features_df["race_id"] == race_id) & (team_features_df["team_id"] == team_id)
+    ]
+    if not team_feature_row.empty and wet_race_prob is not None:
+        team_wet_setup = (team_feature_row["momentum_score"].iloc[0] or 0) * wet_race_prob
+
+    grid_position_std_dev = None
+    expected_race_pace_gaps = None
+    competitive_balance = None
+    race_qual = qualifying_df[qualifying_df["race_id"] == race_id]
+    if not race_qual.empty:
+        grid_position_std_dev = race_qual["qualifying_position"].std()
+        expected_race_pace_gaps = grid_position_std_dev
+        if grid_position_std_dev and grid_position_std_dev > 0:
+            competitive_balance = 1 / grid_position_std_dev
+
+    active_aero = None
+    overtake_efficiency = None
+    power_unit_risk = None
+    regulation_adaptation = None
+    if season >= 2026 and not team_feature_row.empty:
+        active_aero = team_feature_row["performance_trend_last_5_races"].iloc[0]
+        overtake_efficiency = team_feature_row["momentum_score"].iloc[0]
+        power_unit_risk = (team_feature_row["dnf_rate_last_10_races"].iloc[0] or 0)
+        regulation_adaptation = team_feature_row["momentum_score"].iloc[0]
+
+    first_lap_incident_prob = None
+    if safety_car_prob is not None or red_flag_prob is not None:
+        base = [p for p in [safety_car_prob, red_flag_prob] if p is not None]
+        if base:
+            first_lap_incident_prob = min(1.0, float(pd.Series(base).mean()))
+
+    return {
+        "grid_position": grid_position,
+        "starting_tire_compound": starting_tire,
+        "grid_side": grid_side,
+        "positions_historically_gained_from_this_grid": positions_historically_gained,
+        "expected_lap1_position": expected_lap1_position,
+        "optimal_tire_strategy": optimal_tire_strategy,
+        "tire_compound_advantage": tire_compound_advantage,
+        "pit_window_overlap_count": pit_window_overlap_count,
+        "undercut_opportunity_score": undercut_opportunity,
+        "overcut_opportunity_score": overcut_opportunity,
+        "strategic_position_value": strategic_position_value,
+        "championship_position": championship_position,
+        "points_gap_to_next": points_gap_next,
+        "points_gap_to_previous": points_gap_prev,
+        "mathematical_championship_possible": mathematical_possible,
+        "must_win_race_flag": must_win,
+        "team_orders_risk_score": team_orders_risk,
+        "first_lap_incident_probability": first_lap_incident_prob,
+        "safety_car_probability": safety_car_prob,
+        "red_flag_probability": red_flag_prob,
+        "expected_dnf_rate": expected_dnf_rate,
+        "wet_race_probability": wet_race_prob,
+        "weather_change_during_race_probability": weather_change_prob,
+        "driver_wet_weather_advantage": driver_wet_adv,
+        "team_wet_setup_effectiveness": team_wet_setup,
+        "grid_position_std_dev": grid_position_std_dev,
+        "expected_race_pace_gaps": expected_race_pace_gaps,
+        "competitive_balance_index": competitive_balance,
+        "active_aero_adaptation_score": active_aero,
+        "overtake_mode_efficiency": overtake_efficiency,
+        "new_power_unit_reliability_risk": power_unit_risk,
+        "regulation_adaptation_success": regulation_adaptation,
+    }
+
+
+def update_situational_features(engine: Engine) -> None:
+    with engine.begin() as conn:
+        race_driver_pairs = pd.read_sql(
+            sa.select(race_results.c.race_id, race_results.c.driver_id).distinct(),
+            conn,
+        )
+        for _, row in race_driver_pairs.iterrows():
+            features = extract_race_features(conn, int(row["race_id"]), int(row["driver_id"]))
+            if not features:
+                continue
+            stmt = pg_insert(situational_features).values(
+                race_id=int(row["race_id"]),
+                driver_id=int(row["driver_id"]),
+                **features,
+            )
+            stmt = stmt.on_conflict_do_update(
+                constraint="uq_situational_features",
+                set_=features,
+            )
+            conn.execute(stmt)
+
+
 def main() -> None:
     setup_logging()
     args = parse_args()
@@ -1819,6 +2201,7 @@ def main() -> None:
     update_circuit_tables(engine)
     update_driver_features(engine)
     update_team_features(engine)
+    update_situational_features(engine)
     with engine.begin() as conn:
         report = build_data_quality_report(conn)
     report_path = "data_quality_report.json"
