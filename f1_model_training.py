@@ -14,6 +14,12 @@ import lightgbm as lgb
 import tensorflow as tf
 from tensorflow import keras
 from keras import layers
+from imblearn.over_sampling import SMOTE
+from imblearn.under_sampling import RandomUnderSampler
+from imblearn.pipeline import Pipeline
+from sklearn.metrics import mean_absolute_error, mean_squared_error, roc_auc_score
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import mean_absolute_error, mean_squared_error, roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
@@ -111,6 +117,41 @@ def select_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     return features, feature_cols
 
 
+def create_cv_folds(seasons: pd.Series) -> List[Dict[str, str]]:
+    folds = [
+        {"train": "2010-2017", "val": "2018", "description": "Early season baseline"},
+        {"train": "2010-2019", "val": "2020", "description": "Pre-COVID era"},
+        {"train": "2010-2021", "val": "2022", "description": "Before new regs"},
+        {"train": "2010-2022", "val": "2023", "description": "Post new regs"},
+        {"train": "2010-2023", "val": "2024", "description": "Most recent"},
+        {"train": "2010-2024", "test": "2025", "description": "Final test set"},
+    ]
+    available = set(seasons.unique())
+    valid_folds = []
+    for fold in folds:
+        train_end = int(fold["train"].split("-")[1])
+        train_years = list(range(2010, train_end + 1))
+        if not set(train_years).issubset(available):
+            continue
+        val_year = int(fold.get("val", fold.get("test")))
+        if val_year not in available:
+            continue
+        valid_folds.append(fold)
+    return valid_folds
+
+
+def build_fold_indices(
+    df: pd.DataFrame, folds: List[Dict[str, str]]
+) -> List[Tuple[np.ndarray, np.ndarray, str]]:
+    fold_indices = []
+    for fold in folds:
+        train_end = int(fold["train"].split("-")[1])
+        train_years = list(range(2010, train_end + 1))
+        val_year = int(fold.get("val", fold.get("test")))
+        train_mask = df["season"].isin(train_years)
+        val_mask = df["season"] == val_year
+        fold_indices.append((df.index[train_mask].to_numpy(), df.index[val_mask].to_numpy(), fold["description"]))
+    return fold_indices
 def time_series_cv(
     X: pd.DataFrame, y: pd.Series, n_splits: int
 ) -> List[Tuple[np.ndarray, np.ndarray]]:
@@ -121,12 +162,30 @@ def time_series_cv(
 def tune_xgb_position(
     X: pd.DataFrame,
     y: pd.Series,
+    splits: List[Tuple[np.ndarray, np.ndarray, str]],
     splits: List[Tuple[np.ndarray, np.ndarray]],
     trials: int,
 ) -> Dict:
     def objective(trial: optuna.Trial) -> float:
         params = {
             "objective": "reg:squarederror",
+            "n_estimators": trial.suggest_int("n_estimators", 100, 1000),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "max_depth": trial.suggest_int("max_depth", 3, 12),
+            "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+            "gamma": trial.suggest_float("gamma", 0.0, 1.0),
+            "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 1.0),
+            "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 10.0),
+            "random_state": 42,
+        }
+        scores = []
+        for train_idx, test_idx, _ in splits:
+            model = xgb.XGBRegressor(**params)
+            model.fit(X.iloc[train_idx], y.iloc[train_idx])
+            preds = model.predict(X.iloc[test_idx])
+            scores.append(mean_absolute_error(y.iloc[test_idx], preds))
             "n_estimators": trial.suggest_int("n_estimators", 200, 600),
             "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1),
             "max_depth": trial.suggest_int("max_depth", 4, 9),
@@ -160,6 +219,7 @@ def train_xgb_position(X: pd.DataFrame, y: pd.Series, params: Dict) -> xgb.XGBRe
 def tune_lgb_time(
     X: pd.DataFrame,
     y: pd.Series,
+    splits: List[Tuple[np.ndarray, np.ndarray, str]],
     splits: List[Tuple[np.ndarray, np.ndarray]],
     trials: int,
 ) -> Dict:
@@ -176,6 +236,7 @@ def tune_lgb_time(
             "n_estimators": trial.suggest_int("n_estimators", 150, 400),
         }
         scores = []
+        for train_idx, test_idx, _ in splits:
         for train_idx, test_idx in splits:
             model = lgb.LGBMRegressor(**params)
             model.fit(X.iloc[train_idx], y.iloc[train_idx])
@@ -195,6 +256,19 @@ def train_lgb_time(X: pd.DataFrame, y: pd.Series, params: Dict) -> lgb.LGBMRegre
 
 
 def train_lgb_position(X: pd.DataFrame, y: pd.Series, params: Dict) -> lgb.LGBMRegressor:
+    lgb_params = dict(params)
+    lgb_params.update({"objective": "quantile", "alpha": 0.5})
+    model = lgb.LGBMRegressor(**lgb_params)
+    model.fit(X, y)
+    return model
+
+
+def train_lgb_position_quantile(
+    X: pd.DataFrame, y: pd.Series, params: Dict, alpha: float
+) -> lgb.LGBMRegressor:
+    lgb_params = dict(params)
+    lgb_params.update({"objective": "quantile", "alpha": alpha})
+    model = lgb.LGBMRegressor(**lgb_params)
     model = lgb.LGBMRegressor(**params)
     model.fit(X, y)
     return model
@@ -206,12 +280,27 @@ def train_xgb_time(X: pd.DataFrame, y: pd.Series, params: Dict) -> xgb.XGBRegres
     return model
 
 
+def resample_for_dnf(X: pd.DataFrame, y: pd.Series) -> Tuple[pd.DataFrame, pd.Series]:
+    over = SMOTE(sampling_strategy=0.3, random_state=42)
+    under = RandomUnderSampler(sampling_strategy=0.6, random_state=42)
+    pipeline = Pipeline([("over", over), ("under", under)])
+    X_resampled, y_resampled = pipeline.fit_resample(X, y)
+    return X_resampled, y_resampled
+
+
+def train_xgb_dnf(X: pd.DataFrame, y: pd.Series) -> xgb.XGBClassifier:
+    class_ratio = (y == 0).sum() / max((y == 1).sum(), 1)
 def train_xgb_dnf(X: pd.DataFrame, y: pd.Series) -> xgb.XGBClassifier:
     params = {
         "objective": "binary:logistic",
         "n_estimators": 200,
         "max_depth": 5,
         "learning_rate": 0.05,
+        "scale_pos_weight": class_ratio,
+    }
+    X_resampled, y_resampled = resample_for_dnf(X, y)
+    model = xgb.XGBClassifier(**params)
+    model.fit(X_resampled, y_resampled)
         "scale_pos_weight": 10,
     }
     model = xgb.XGBClassifier(**params)
@@ -226,6 +315,12 @@ def train_xgb_podium(X: pd.DataFrame, y: pd.Series) -> xgb.XGBClassifier:
         "n_estimators": 300,
         "max_depth": 6,
     }
+    classes = np.array(sorted(y.unique()))
+    weights = compute_class_weight("balanced", classes=classes, y=y)
+    class_weight = dict(zip(classes, weights))
+    sample_weight = y.map(class_weight).to_numpy()
+    model = xgb.XGBClassifier(**params)
+    model.fit(X, y, sample_weight=sample_weight)
     model = xgb.XGBClassifier(**params)
     model.fit(X, y)
     return model
@@ -368,6 +463,7 @@ def train_rf_classifier(X: pd.DataFrame, y: pd.Series) -> RandomForestClassifier
         "bootstrap": True,
         "random_state": 42,
         "n_jobs": -1,
+        "class_weight": "balanced",
     }
     model = RandomForestClassifier(**params)
     model.fit(X, y)
@@ -375,6 +471,7 @@ def train_rf_classifier(X: pd.DataFrame, y: pd.Series) -> RandomForestClassifier
 
 
 def evaluate_models(
+    df: pd.DataFrame,
     X: pd.DataFrame,
     y_position: pd.Series,
     y_time: pd.Series,
@@ -387,6 +484,22 @@ def evaluate_models(
 ) -> None:
     os.makedirs(model_dir, exist_ok=True)
 
+    folds = create_cv_folds(df["season"])
+    fold_indices = build_fold_indices(df, folds)
+
+    xgb_params = tune_xgb_position(X, y_position, fold_indices, optuna_trials)
+    lgb_params = tune_lgb_time(X, y_time, fold_indices, optuna_trials)
+
+    evaluate_time_series_folds(
+        df,
+        X,
+        y_position,
+        y_time,
+        y_winner,
+        xgb_params,
+        lgb_params,
+        fold_indices,
+    )
     splits = time_series_cv(X, y_position, n_splits=n_splits)
 
     xgb_params = tune_xgb_position(X, y_position, splits, optuna_trials)
@@ -395,6 +508,8 @@ def evaluate_models(
     position_model = train_xgb_position(X, y_position, xgb_params)
     time_model = train_lgb_time(X, y_time, lgb_params)
     lgb_position_model = train_lgb_position(X, y_position, lgb_params)
+    lgb_position_low = train_lgb_position_quantile(X, y_position, lgb_params, 0.1)
+    lgb_position_high = train_lgb_position_quantile(X, y_position, lgb_params, 0.9)
     xgb_time_model = train_xgb_time(X, y_time, xgb_params)
     dnf_model = train_xgb_dnf(X, y_dnf)
     podium_model = train_xgb_podium(X, y_podium)
@@ -408,6 +523,8 @@ def evaluate_models(
     joblib.dump(position_model, os.path.join(model_dir, "xgb_position.joblib"))
     joblib.dump(time_model, os.path.join(model_dir, "lgb_time.joblib"))
     joblib.dump(lgb_position_model, os.path.join(model_dir, "lgb_position.joblib"))
+    joblib.dump(lgb_position_low, os.path.join(model_dir, "lgb_position_q10.joblib"))
+    joblib.dump(lgb_position_high, os.path.join(model_dir, "lgb_position_q90.joblib"))
     joblib.dump(xgb_time_model, os.path.join(model_dir, "xgb_time.joblib"))
     joblib.dump(dnf_model, os.path.join(model_dir, "xgb_dnf.joblib"))
     joblib.dump(podium_model, os.path.join(model_dir, "xgb_podium.joblib"))
@@ -474,6 +591,91 @@ def save_rf_feature_importance(model, X: pd.DataFrame, model_dir: str, name: str
     importance.to_csv(importance_path, header=["importance"])
 
 
+def compute_fold_metrics(
+    df_fold: pd.DataFrame,
+    position_preds: np.ndarray,
+    time_preds: np.ndarray,
+    winner_probs: np.ndarray,
+) -> Dict[str, float]:
+    eval_df = df_fold.copy()
+    eval_df["pred_position"] = position_preds
+    eval_df["pred_time"] = time_preds
+    eval_df["winner_prob"] = winner_probs
+
+    winner_hits = []
+    top3_hits = []
+    top10_hits = []
+    spearman_scores = []
+
+    for _, race_df in eval_df.groupby("race_id"):
+        actual_winner = race_df.loc[race_df["finishing_position"].idxmin(), "driver_id"]
+        predicted_winner = race_df.loc[race_df["winner_prob"].idxmax(), "driver_id"]
+        winner_hits.append(actual_winner == predicted_winner)
+
+        actual_top3 = set(race_df.nsmallest(3, "finishing_position")["driver_id"])
+        pred_top3 = set(race_df.nsmallest(3, "pred_position")["driver_id"])
+        top3_hits.append(len(actual_top3 & pred_top3) / 3)
+
+        actual_top10 = set(race_df.nsmallest(10, "finishing_position")["driver_id"])
+        pred_top10 = set(race_df.nsmallest(10, "pred_position")["driver_id"])
+        top10_hits.append(len(actual_top10 & pred_top10) / 10)
+
+        spearman = pd.Series(race_df["pred_position"]).corr(
+            pd.Series(race_df["finishing_position"]), method="spearman"
+        )
+        if not np.isnan(spearman):
+            spearman_scores.append(spearman)
+
+    return {
+        "winner_accuracy": float(np.mean(winner_hits)) if winner_hits else 0.0,
+        "top3_accuracy": float(np.mean(top3_hits)) if top3_hits else 0.0,
+        "top10_accuracy": float(np.mean(top10_hits)) if top10_hits else 0.0,
+        "position_mae": float(mean_absolute_error(eval_df["finishing_position"], eval_df["pred_position"])),
+        "time_mae": float(mean_absolute_error(eval_df["race_time_delta"], eval_df["pred_time"])),
+        "spearman": float(np.mean(spearman_scores)) if spearman_scores else 0.0,
+    }
+
+
+def evaluate_time_series_folds(
+    df: pd.DataFrame,
+    X: pd.DataFrame,
+    y_position: pd.Series,
+    y_time: pd.Series,
+    y_winner: pd.Series,
+    xgb_params: Dict,
+    lgb_params: Dict,
+    folds: List[Tuple[np.ndarray, np.ndarray, str]],
+) -> None:
+    for train_idx, val_idx, label in folds:
+        X_train = X.iloc[train_idx]
+        y_pos_train = y_position.iloc[train_idx]
+        y_time_train = y_time.iloc[train_idx]
+        y_win_train = y_winner.iloc[train_idx]
+
+        position_model = train_xgb_position(X_train, y_pos_train, xgb_params)
+        time_model = train_lgb_time(X_train, y_time_train, lgb_params)
+        winner_model = train_rf_classifier(X_train, y_win_train)
+
+        X_val = X.iloc[val_idx]
+        val_df = df.iloc[val_idx]
+
+        position_preds = position_model.predict(X_val)
+        time_preds = time_model.predict(X_val)
+        winner_probs = winner_model.predict_proba(X_val)[:, 1]
+
+        metrics = compute_fold_metrics(val_df, position_preds, time_preds, winner_probs)
+        LOG.info(
+            "Fold %s - Winner Acc: %.3f | Top3 Acc: %.3f | Top10 Acc: %.3f | Pos MAE: %.3f | Time MAE: %.3f | Spearman: %.3f",
+            label,
+            metrics["winner_accuracy"],
+            metrics["top3_accuracy"],
+            metrics["top10_accuracy"],
+            metrics["position_mae"],
+            metrics["time_mae"],
+            metrics["spearman"],
+        )
+
+
 def main() -> None:
     setup_logging()
     args = parse_args()
@@ -483,6 +685,7 @@ def main() -> None:
     features, _ = select_features(df)
 
     evaluate_models(
+        df,
         features,
         df["finishing_position"],
         df["race_time_delta"],
