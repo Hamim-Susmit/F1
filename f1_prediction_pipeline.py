@@ -264,3 +264,125 @@ class F1RacePredictor:
                     os.path.getmtime(path), tz=timezone.utc
                 ).isoformat()
         return versions
+
+
+class LivePredictionUpdater:
+    def __init__(self, predictor: F1RacePredictor) -> None:
+        self.predictor = predictor
+        self.cache: Dict[int, Dict[str, Any]] = {}
+
+    def update_from_practice(
+        self,
+        race_id: int,
+        fp1_times: pd.DataFrame,
+        fp2_times: pd.DataFrame,
+        fp3_times: pd.DataFrame,
+    ) -> Dict[str, Any]:
+        long_run_pace = self.analyze_practice_pace(fp2_times, fp3_times)
+        for team, pace in long_run_pace.items():
+            self.update_team_performance(team, pace)
+        updated = self.predictor.predict_race(race_id, use_latest_data=True)
+        self.cache[race_id] = updated
+        return updated
+
+    def update_from_qualifying(
+        self, race_id: int, quali_results: Dict[int, int]
+    ) -> Dict[str, Any]:
+        for driver_id, grid_pos in quali_results.items():
+            self.update_driver_grid(driver_id, grid_pos)
+        updated = self.predictor.predict_race(race_id, use_latest_data=True)
+        self.cache[race_id] = updated
+        return updated
+
+    def update_from_weather_change(
+        self, race_id: int, new_forecast: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        current = self.cache.get(race_id)
+        if current is None:
+            updated = self.predictor.predict_race(race_id)
+            self.cache[race_id] = updated
+            return updated
+        old_rain_prob = current["metadata"].get("weather_forecast", {}).get("rain_probability")
+        new_rain_prob = new_forecast.get("rain_probability")
+        if old_rain_prob is None or new_rain_prob is None:
+            return current
+        if abs(new_rain_prob - old_rain_prob) > 0.15:
+            updated = self.predictor.predict_race(race_id, use_latest_data=True)
+            self.cache[race_id] = updated
+            return updated
+        return current
+
+    def post_race_learning(
+        self, race_id: int, actual_results: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]] | None:
+        predicted = self.cache.get(race_id)
+        if predicted is None:
+            return None
+        errors = []
+        for pred, actual in zip(predicted["predictions"], actual_results):
+            errors.append(
+                {
+                    "driver": pred["driver"],
+                    "predicted_pos": pred["position"],
+                    "actual_pos": actual["position"],
+                    "position_error": abs(pred["position"] - actual["position"]),
+                    "dnf_predicted": pred["dnf_probability"],
+                    "dnf_actual": actual.get("dnf"),
+                }
+            )
+        self.store_prediction_errors(race_id, errors)
+        if self.get_races_since_retrain() >= 5:
+            self.trigger_retraining()
+        return errors
+
+    def analyze_practice_pace(
+        self, fp2_times: pd.DataFrame, fp3_times: pd.DataFrame
+    ) -> Dict[str, float]:
+        combined = pd.concat([fp2_times, fp3_times], ignore_index=True)
+        if "team_name" not in combined or "lap_time" not in combined:
+            return {}
+        pace = combined.groupby("team_name")["lap_time"].median().to_dict()
+        return {team: float(value) for team, value in pace.items()}
+
+    def update_team_performance(self, team_name: str, pace: float) -> None:
+        query = sa.text(
+            """
+            UPDATE team_features tf
+            SET performance_trend_last_5_races = :pace
+            FROM teams t
+            WHERE tf.team_id = t.team_id AND t.team_name = :team_name
+            """
+        )
+        with self.predictor.engine.begin() as conn:
+            conn.execute(query, {"team_name": team_name, "pace": pace})
+
+    def update_driver_grid(self, driver_id: int, grid_position: int) -> None:
+        query = sa.text(
+            """
+            UPDATE situational_features
+            SET grid_position = :grid_position
+            WHERE driver_id = :driver_id
+            """
+        )
+        with self.predictor.engine.begin() as conn:
+            conn.execute(query, {"driver_id": driver_id, "grid_position": grid_position})
+
+    def store_prediction_errors(self, race_id: int, errors: List[Dict[str, Any]]) -> None:
+        payload = pd.DataFrame(errors)
+        path = os.path.join(self.predictor.model_dir, f"prediction_errors_race_{race_id}.csv")
+        payload.to_csv(path, index=False)
+
+    def get_races_since_retrain(self) -> int:
+        marker = os.path.join(self.predictor.model_dir, "last_retrain_marker.txt")
+        if not os.path.exists(marker):
+            return 999
+        try:
+            with open(marker, "r", encoding="utf-8") as handle:
+                return int(handle.read().strip())
+        except ValueError:
+            return 999
+
+    def trigger_retraining(self) -> None:
+        marker = os.path.join(self.predictor.model_dir, "last_retrain_marker.txt")
+        with open(marker, "w", encoding="utf-8") as handle:
+            handle.write("0")
