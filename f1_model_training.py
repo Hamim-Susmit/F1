@@ -118,6 +118,42 @@ def time_series_cv(
     return list(tscv.split(X, y))
 
 
+def create_time_series_folds() -> List[Dict[str, str]]:
+    return [
+        {"train": "2010-2017", "val": "2018", "description": "Early season baseline"},
+        {"train": "2010-2019", "val": "2020", "description": "Pre-COVID era"},
+        {"train": "2010-2021", "val": "2022", "description": "Before new regs"},
+        {"train": "2010-2022", "val": "2023", "description": "Post new regs"},
+        {"train": "2010-2023", "val": "2024", "description": "Most recent"},
+        {"train": "2010-2024", "test": "2025", "description": "Final test set"},
+    ]
+
+
+def build_season_mask(df: pd.DataFrame, season_range: str) -> pd.Series:
+    start_year, end_year = (int(year) for year in season_range.split("-"))
+    return df["season"].between(start_year, end_year)
+
+
+def build_fold_indices(
+    df: pd.DataFrame, folds: List[Dict[str, str]]
+) -> List[Tuple[str, np.ndarray, np.ndarray]]:
+    indices = []
+    for fold in folds:
+        train_mask = build_season_mask(df, fold["train"])
+        val_key = "val" if "val" in fold else "test"
+        val_year = int(fold[val_key])
+        val_mask = df["season"] == val_year
+        if not train_mask.any() or not val_mask.any():
+            LOG.warning(
+                "Skipping fold '%s' because train or %s data is missing.",
+                fold["description"],
+                val_key,
+            )
+            continue
+        indices.append((fold["description"], df.index[train_mask].to_numpy(), df.index[val_mask].to_numpy()))
+    return indices
+
+
 def tune_xgb_position(
     X: pd.DataFrame,
     y: pd.Series,
@@ -375,6 +411,7 @@ def train_rf_classifier(X: pd.DataFrame, y: pd.Series) -> RandomForestClassifier
 
 
 def evaluate_models(
+    df: pd.DataFrame,
     X: pd.DataFrame,
     y_position: pd.Series,
     y_time: pd.Series,
@@ -387,10 +424,16 @@ def evaluate_models(
 ) -> None:
     os.makedirs(model_dir, exist_ok=True)
 
-    splits = time_series_cv(X, y_position, n_splits=n_splits)
+    fold_indices = build_fold_indices(df, create_time_series_folds())
+    if fold_indices:
+        splits = [(train_idx, val_idx) for _, train_idx, val_idx in fold_indices]
+    else:
+        splits = time_series_cv(X, y_position, n_splits=n_splits)
 
     xgb_params = tune_xgb_position(X, y_position, splits, optuna_trials)
     lgb_params = tune_lgb_time(X, y_time, splits, optuna_trials)
+
+    evaluate_time_series_folds(df, X, xgb_params, lgb_params)
 
     position_model = train_xgb_position(X, y_position, xgb_params)
     time_model = train_lgb_time(X, y_time, lgb_params)
@@ -461,6 +504,99 @@ def evaluate_models(
     save_rf_feature_importance(rf_winner_model, X, model_dir, "rf_winner")
 
 
+def evaluate_time_series_folds(
+    df: pd.DataFrame,
+    features: pd.DataFrame,
+    position_params: Dict,
+    time_params: Dict,
+) -> None:
+    folds = create_time_series_folds()
+    fold_indices = build_fold_indices(df, folds)
+    if not fold_indices:
+        LOG.warning("No time-series folds available for evaluation.")
+        return
+
+    metrics = []
+    for description, train_idx, val_idx in fold_indices:
+        X_train = features.loc[train_idx]
+        X_val = features.loc[val_idx]
+        y_position_train = df.loc[train_idx, "finishing_position"]
+        y_position_val = df.loc[val_idx, "finishing_position"]
+        y_time_train = df.loc[train_idx, "race_time_delta"]
+        y_time_val = df.loc[val_idx, "race_time_delta"]
+
+        position_model = train_xgb_position(X_train, y_position_train, position_params)
+        time_model = train_lgb_time(X_train, y_time_train, time_params)
+
+        position_preds = position_model.predict(X_val)
+        time_preds = time_model.predict(X_val)
+
+        fold_df = df.loc[val_idx, ["race_id", "driver_id", "finishing_position"]].copy()
+        fold_df["predicted_position"] = position_preds
+        fold_df["predicted_rank"] = (
+            fold_df.groupby("race_id")["predicted_position"].rank(method="first")
+        )
+
+        winner_hits = []
+        top3_hits = []
+        top10_hits = []
+        spearman_scores = []
+
+        for _, group in fold_df.groupby("race_id"):
+            actual_sorted = group.sort_values("finishing_position")
+            predicted_sorted = group.sort_values("predicted_position")
+
+            winner_hits.append(
+                int(actual_sorted.iloc[0]["driver_id"] == predicted_sorted.iloc[0]["driver_id"])
+            )
+
+            actual_top3 = set(actual_sorted.head(3)["driver_id"])
+            predicted_top3 = set(predicted_sorted.head(3)["driver_id"])
+            top3_hits.append(len(actual_top3 & predicted_top3) / 3)
+
+            top10_count = min(10, len(group))
+            actual_top10 = set(actual_sorted.head(top10_count)["driver_id"])
+            predicted_top10 = set(predicted_sorted.head(top10_count)["driver_id"])
+            top10_hits.append(len(actual_top10 & predicted_top10) / top10_count)
+
+            corr = group[["predicted_rank", "finishing_position"]].corr(method="spearman").iloc[0, 1]
+            if pd.notna(corr):
+                spearman_scores.append(corr)
+
+        fold_metrics = {
+            "fold": description,
+            "winner_accuracy": float(np.mean(winner_hits)),
+            "top3_accuracy": float(np.mean(top3_hits)),
+            "top10_accuracy": float(np.mean(top10_hits)),
+            "mae_position": float(mean_absolute_error(y_position_val, position_preds)),
+            "mae_time": float(mean_absolute_error(y_time_val, time_preds)),
+            "spearman_corr": float(np.mean(spearman_scores)) if spearman_scores else float("nan"),
+        }
+        metrics.append(fold_metrics)
+        LOG.info(
+            "Fold '%s' metrics: winner=%.3f top3=%.3f top10=%.3f mae_pos=%.3f mae_time=%.3f spearman=%.3f",
+            description,
+            fold_metrics["winner_accuracy"],
+            fold_metrics["top3_accuracy"],
+            fold_metrics["top10_accuracy"],
+            fold_metrics["mae_position"],
+            fold_metrics["mae_time"],
+            fold_metrics["spearman_corr"],
+        )
+
+    if metrics:
+        avg = pd.DataFrame(metrics).drop(columns=["fold"]).mean(numeric_only=True).to_dict()
+        LOG.info(
+            "Average CV metrics: winner=%.3f top3=%.3f top10=%.3f mae_pos=%.3f mae_time=%.3f spearman=%.3f",
+            avg.get("winner_accuracy", float("nan")),
+            avg.get("top3_accuracy", float("nan")),
+            avg.get("top10_accuracy", float("nan")),
+            avg.get("mae_position", float("nan")),
+            avg.get("mae_time", float("nan")),
+            avg.get("spearman_corr", float("nan")),
+        )
+
+
 def explain_model(model, X: pd.DataFrame, model_dir: str, name: str) -> None:
     explainer = shap.TreeExplainer(model)
     shap_values = explainer.shap_values(X)
@@ -483,6 +619,7 @@ def main() -> None:
     features, _ = select_features(df)
 
     evaluate_models(
+        df,
         features,
         df["finishing_position"],
         df["race_time_delta"],
