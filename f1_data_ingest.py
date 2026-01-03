@@ -3,10 +3,11 @@ import json
 import logging
 import os
 import time
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
+import requests
 import sqlalchemy as sa
 from fastf1 import Cache, get_event_schedule, get_session
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -100,6 +101,46 @@ pit_stops = sa.Table(
     sa.Column("tire_out", sa.String),
 )
 
+race_weather = sa.Table(
+    "race_weather",
+    metadata,
+    sa.Column("weather_id", sa.Integer, primary_key=True),
+    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
+    sa.Column("session_type", sa.String, nullable=False),
+    sa.Column("air_temp", sa.Float),
+    sa.Column("track_temp", sa.Float),
+    sa.Column("rain_probability", sa.Float),
+    sa.Column("rain_amount", sa.Float),
+    sa.Column("humidity", sa.Float),
+    sa.Column("wind_speed", sa.Float),
+    sa.Column("wind_direction", sa.Float),
+    sa.Column("conditions", sa.String),
+    sa.Column("wet_race_probability", sa.Float),
+    sa.Column("temp_deviation", sa.Float),
+    sa.Column("weather_change_probability", sa.Float),
+    sa.Column("is_estimated", sa.Boolean, default=False),
+    sa.Column("source", sa.String),
+    sa.Column("observed_at", sa.DateTime(timezone=True)),
+)
+
+race_weather_forecasts = sa.Table(
+    "race_weather_forecasts",
+    metadata,
+    sa.Column("forecast_id", sa.Integer, primary_key=True),
+    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
+    sa.Column("session_type", sa.String, nullable=False),
+    sa.Column("forecast_time", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("air_temp", sa.Float),
+    sa.Column("track_temp", sa.Float),
+    sa.Column("rain_probability", sa.Float),
+    sa.Column("rain_amount", sa.Float),
+    sa.Column("humidity", sa.Float),
+    sa.Column("wind_speed", sa.Float),
+    sa.Column("wind_direction", sa.Float),
+    sa.Column("conditions", sa.String),
+    sa.Column("source", sa.String),
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="FastF1 data ingester for PostgreSQL.")
@@ -108,6 +149,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--database-url", default=os.environ.get("DATABASE_URL"))
     parser.add_argument("--cache-dir", default=os.environ.get("FASTF1_CACHE", ".fastf1_cache"))
     parser.add_argument("--sleep", type=float, default=1.0, help="Seconds to sleep between API calls.")
+    parser.add_argument("--weather-api-key", default=os.environ.get("OPENWEATHER_API_KEY"))
+    parser.add_argument("--weather-base-url", default=os.environ.get("WEATHER_BASE_URL", "https://api.openweathermap.org"))
     return parser.parse_args()
 
 
@@ -382,18 +425,225 @@ def build_data_quality_report(conn: sa.Connection) -> Dict[str, Any]:
             "qualifying_results": count(qualifying_results),
             "lap_times": count(lap_times),
             "pit_stops": count(pit_stops),
+            "race_weather": count(race_weather),
+            "race_weather_forecasts": count(race_weather_forecasts),
         },
         "missing_values": {
             "race_results_race_time": null_count(race_results, race_results.c.race_time),
             "qualifying_q1_time": null_count(qualifying_results, qualifying_results.c.q1_time),
             "lap_times_lap_time": null_count(lap_times, lap_times.c.lap_time),
             "pit_stops_duration": null_count(pit_stops, pit_stops.c.duration),
+            "race_weather_air_temp": null_count(race_weather, race_weather.c.air_temp),
         },
     }
     return report
 
 
-def ingest_season(engine: Engine, season: int, sleep_time: float) -> None:
+def classify_conditions(rain_amount: Optional[float], rain_probability: Optional[float]) -> str:
+    if rain_amount and rain_amount >= 0.5:
+        return "wet"
+    if rain_probability and rain_probability >= 50:
+        return "mixed"
+    return "dry"
+
+
+def get_session_times(event: pd.Series) -> List[Tuple[str, datetime]]:
+    sessions = []
+    for index in range(1, 6):
+        name = event.get(f"Session{index}")
+        session_date = event.get(f"Session{index}Date")
+        if pd.isna(name) or pd.isna(session_date):
+            continue
+        if hasattr(session_date, "to_pydatetime"):
+            session_dt = session_date.to_pydatetime()
+        else:
+            session_dt = session_date
+        if session_dt.tzinfo is None:
+            session_dt = session_dt.replace(tzinfo=timezone.utc)
+        sessions.append((str(name), session_dt))
+    return sessions
+
+
+def fetch_openweather(
+    api_key: str,
+    base_url: str,
+    lat: float,
+    lon: float,
+    timestamp: datetime,
+) -> Optional[Dict[str, Any]]:
+    unix_time = int(timestamp.timestamp())
+    url = f"{base_url}/data/3.0/onecall/timemachine"
+    params = {"lat": lat, "lon": lon, "dt": unix_time, "appid": api_key, "units": "metric"}
+    try:
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as exc:
+        LOG.warning("Weather API request failed: %s", exc)
+        return None
+
+
+def fetch_openweather_forecast(
+    api_key: str,
+    base_url: str,
+    lat: float,
+    lon: float,
+) -> Optional[Dict[str, Any]]:
+    url = f"{base_url}/data/3.0/onecall"
+    params = {"lat": lat, "lon": lon, "appid": api_key, "units": "metric", "exclude": "minutely,alerts"}
+    try:
+        response = requests.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        return response.json()
+    except requests.RequestException as exc:
+        LOG.warning("Weather forecast request failed: %s", exc)
+        return None
+
+
+def circuit_average_conditions(conn: sa.Connection, circuit_name: str, month: int) -> Dict[str, Optional[float]]:
+    stmt = (
+        sa.select(
+            sa.func.avg(race_weather.c.air_temp).label("air_temp"),
+            sa.func.avg(race_weather.c.track_temp).label("track_temp"),
+            sa.func.avg(race_weather.c.rain_probability).label("rain_probability"),
+            sa.func.avg(race_weather.c.rain_amount).label("rain_amount"),
+            sa.func.avg(race_weather.c.humidity).label("humidity"),
+            sa.func.avg(race_weather.c.wind_speed).label("wind_speed"),
+        )
+        .select_from(race_weather.join(races, race_weather.c.race_id == races.c.race_id))
+        .where(
+            races.c.circuit_name == circuit_name,
+            sa.extract("month", races.c.race_date) == month,
+            race_weather.c.is_estimated.is_(False),
+        )
+    )
+    row = conn.execute(stmt).mappings().first()
+    if not row:
+        return {}
+    return dict(row)
+
+
+def build_weather_rows(
+    conn: sa.Connection,
+    race_id: int,
+    circuit_name: str,
+    event_date: date,
+    lat: Optional[float],
+    lon: Optional[float],
+    sessions: List[Tuple[str, datetime]],
+    api_key: Optional[str],
+    base_url: str,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    month = event_date.month
+    averages = circuit_average_conditions(conn, circuit_name, month)
+    for session_type, session_dt in sessions:
+        weather_payload = None
+        if api_key and lat is not None and lon is not None:
+            weather_payload = fetch_openweather(api_key, base_url, lat, lon, session_dt)
+        data = None
+        if weather_payload and "data" in weather_payload and weather_payload["data"]:
+            data = weather_payload["data"][0]
+        is_estimated = data is None
+        air_temp = None
+        track_temp = None
+        humidity = None
+        wind_speed = None
+        wind_deg = None
+        rain_amount = None
+        rain_probability = None
+        if data:
+            air_temp = data.get("temp")
+            track_temp = data.get("feels_like")
+            humidity = data.get("humidity")
+            wind_speed = data.get("wind_speed")
+            wind_deg = data.get("wind_deg")
+            rain_amount = data.get("rain", {}).get("1h") if isinstance(data.get("rain"), dict) else data.get("rain")
+            rain_probability = data.get("pop")
+        if is_estimated and averages:
+            air_temp = averages.get("air_temp")
+            track_temp = averages.get("track_temp")
+            rain_probability = averages.get("rain_probability")
+            rain_amount = averages.get("rain_amount")
+            humidity = averages.get("humidity")
+            wind_speed = averages.get("wind_speed")
+        conditions = classify_conditions(rain_amount, rain_probability)
+        avg_temp = averages.get("air_temp") if averages else None
+        temp_deviation = None
+        if air_temp is not None and avg_temp is not None:
+            temp_deviation = air_temp - avg_temp
+        wet_prob = None
+        if rain_probability is not None:
+            wet_prob = min(1.0, max(0.0, float(rain_probability)))
+            if wet_prob > 1:
+                wet_prob = wet_prob / 100
+        weather_change_probability = None
+        if rain_probability is not None and avg_temp is not None and air_temp is not None:
+            weather_change_probability = min(1.0, abs(air_temp - avg_temp) / 15.0)
+        rows.append(
+            {
+                "race_id": race_id,
+                "session_type": session_type,
+                "air_temp": air_temp,
+                "track_temp": track_temp,
+                "rain_probability": rain_probability,
+                "rain_amount": rain_amount,
+                "humidity": humidity,
+                "wind_speed": wind_speed,
+                "wind_direction": wind_deg,
+                "conditions": conditions,
+                "wet_race_probability": wet_prob,
+                "temp_deviation": temp_deviation,
+                "weather_change_probability": weather_change_probability,
+                "is_estimated": is_estimated,
+                "source": "openweather" if not is_estimated else "estimated",
+                "observed_at": session_dt,
+            }
+        )
+    return rows
+
+
+def build_weather_forecast_rows(
+    race_id: int,
+    sessions: List[Tuple[str, datetime]],
+    lat: Optional[float],
+    lon: Optional[float],
+    api_key: Optional[str],
+    base_url: str,
+) -> List[Dict[str, Any]]:
+    if not api_key or lat is None or lon is None:
+        return []
+    forecast_payload = fetch_openweather_forecast(api_key, base_url, lat, lon)
+    if not forecast_payload or "hourly" not in forecast_payload:
+        return []
+    hourly = forecast_payload["hourly"]
+    rows: List[Dict[str, Any]] = []
+    for session_type, session_dt in sessions:
+        target_ts = int(session_dt.timestamp())
+        closest = min(hourly, key=lambda h: abs(h.get("dt", target_ts) - target_ts))
+        rain_amount = None
+        if "rain" in closest:
+            rain_amount = closest["rain"].get("1h") if isinstance(closest["rain"], dict) else closest["rain"]
+        rows.append(
+            {
+                "race_id": race_id,
+                "session_type": session_type,
+                "forecast_time": datetime.now(timezone.utc),
+                "air_temp": closest.get("temp"),
+                "track_temp": closest.get("feels_like"),
+                "rain_probability": closest.get("pop"),
+                "rain_amount": rain_amount,
+                "humidity": closest.get("humidity"),
+                "wind_speed": closest.get("wind_speed"),
+                "wind_direction": closest.get("wind_deg"),
+                "conditions": classify_conditions(rain_amount, closest.get("pop")),
+                "source": "openweather_forecast",
+            }
+        )
+    return rows
+
+
+def ingest_season(engine: Engine, season: int, sleep_time: float, weather_api_key: Optional[str], base_url: str) -> None:
     schedule = get_schedule(season)
     with engine.begin() as conn:
         for _, event in tqdm(schedule.iterrows(), total=len(schedule), desc=f"Season {season}"):
@@ -427,6 +677,31 @@ def ingest_season(engine: Engine, season: int, sleep_time: float) -> None:
                 race_date,
                 winning_time,
             )
+            lat = event.get("Latitude")
+            lon = event.get("Longitude")
+            sessions = get_session_times(event)
+            weather_rows = build_weather_rows(
+                conn,
+                race_id,
+                circuit_name,
+                race_date,
+                lat,
+                lon,
+                sessions,
+                weather_api_key,
+                base_url,
+            )
+            upsert_rows(conn, race_weather, weather_rows)
+            if season >= 2026:
+                forecast_rows = build_weather_forecast_rows(
+                    race_id,
+                    sessions,
+                    lat,
+                    lon,
+                    weather_api_key,
+                    base_url,
+                )
+                upsert_rows(conn, race_weather_forecasts, forecast_rows)
             driver_rows = build_driver_rows(race_results_df)
             team_rows = build_team_rows(race_results_df)
             driver_map = ensure_drivers(conn, driver_rows)
@@ -463,7 +738,7 @@ def main() -> None:
     create_schema(engine)
     for season in range(args.start_season, args.end_season + 1):
         LOG.info("Starting ingestion for season %s", season)
-        ingest_season(engine, season, args.sleep)
+        ingest_season(engine, season, args.sleep, args.weather_api_key, args.weather_base_url)
     with engine.begin() as conn:
         report = build_data_quality_report(conn)
     report_path = "data_quality_report.json"
