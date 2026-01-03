@@ -56,6 +56,20 @@ class F1RacePredictor:
         self.team_performance_overrides: Dict[str, float] = {}
         self.dnf_overrides: set[int] = set()
 
+    def set_weather_scenario(self, scenario: str | None) -> None:
+        if scenario is None:
+            self.weather_override = None
+            return
+        scenarios = {
+            "dry": {"rain_probability": 0.0, "temp": 25},
+            "mixed": {"rain_probability": 0.3, "temp": 22},
+            "wet": {"rain_probability": 0.8, "temp": 18},
+            "very_wet": {"rain_probability": 1.0, "temp": 16},
+        }
+        if scenario not in scenarios:
+            raise ValueError(f"Unknown scenario '{scenario}'")
+        self.weather_override = scenarios[scenario]
+
     def get_race_info(self, race_id: int) -> Dict[str, Any]:
         query = sa.text(
             """

@@ -1,0 +1,111 @@
+from __future__ import annotations
+
+import os
+from typing import Any, Dict, List, Optional
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+from f1_prediction_pipeline import (
+    F1RacePredictor,
+    LivePredictionUpdater,
+    ModelEvaluator,
+    ScenarioSimulator,
+)
+
+
+app = FastAPI(title="F1 Prediction API", version="1.0")
+
+
+class PredictionRequest(BaseModel):
+    race_id: int
+    include_explanations: bool = True
+    include_confidence: bool = True
+    scenario: Optional[str] = None
+
+
+class DriverPrediction(BaseModel):
+    position: int
+    driver: str
+    team: str
+    confidence: float
+    dnf_probability: float
+    podium_probability: float
+    explanation: Optional[str]
+
+
+class RacePrediction(BaseModel):
+    race_name: str
+    circuit: str
+    date: str
+    predictions: List[DriverPrediction]
+    metadata: Dict[str, Any]
+
+
+def get_predictor() -> F1RacePredictor:
+    database_url = os.environ.get("DATABASE_URL")
+    model_dir = os.environ.get("MODEL_DIR", "models")
+    if not database_url:
+        raise HTTPException(status_code=500, detail="DATABASE_URL must be set")
+    return F1RacePredictor(database_url=database_url, model_dir=model_dir)
+
+
+@app.post("/predict", response_model=RacePrediction)
+async def predict_race(request: PredictionRequest) -> RacePrediction:
+    try:
+        predictor = get_predictor()
+        if request.scenario:
+            predictor.set_weather_scenario(request.scenario)
+        predictions = predictor.predict_race(race_id=request.race_id, use_latest_data=True)
+        if not request.include_explanations:
+            for item in predictions["predictions"]:
+                item["explanation"] = None
+        if not request.include_confidence:
+            for item in predictions["predictions"]:
+                item["confidence"] = 0.0
+        race = predictions["race"]
+        return RacePrediction(
+            race_name=race["race_name"],
+            circuit=race["circuit_name"],
+            date=str(race["race_date"]),
+            predictions=[DriverPrediction(**item) for item in predictions["predictions"]],
+            metadata=predictions["metadata"],
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/races/upcoming")
+async def get_upcoming_races() -> Dict[str, Any]:
+    return {
+        "races": [
+            {"race_id": 202601, "date": "2026-03-06", "circuit": "Albert Park"},
+            {"race_id": 202602, "date": "2026-03-13", "circuit": "Shanghai"},
+        ]
+    }
+
+
+@app.get("/model/performance")
+async def get_model_performance() -> Dict[str, Any]:
+    evaluator = ModelEvaluator()
+    return evaluator.generate_report(season=2026)
+
+
+@app.post("/scenarios/simulate")
+async def simulate_scenarios(race_id: int, scenarios: List[str]) -> Dict[str, Any]:
+    predictor = get_predictor()
+    simulator = ScenarioSimulator(predictor)
+    if scenarios:
+        predictor.set_weather_scenario(scenarios[0])
+    comparison = simulator.simulate_weather_scenarios(race_id)
+    predictor.set_weather_scenario(None)
+    return comparison
+
+
+@app.post("/update/qualifying")
+async def update_from_qualifying(
+    race_id: int, quali_results: Dict[int, int]
+) -> Dict[str, Any]:
+    predictor = get_predictor()
+    updater = LivePredictionUpdater(predictor)
+    return updater.update_from_qualifying(race_id, quali_results)
