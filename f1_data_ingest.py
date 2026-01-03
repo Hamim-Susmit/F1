@@ -308,6 +308,17 @@ situational_features = sa.Table(
     sa.Column("overtake_mode_efficiency", sa.Float),
     sa.Column("new_power_unit_reliability_risk", sa.Float),
     sa.Column("regulation_adaptation_success", sa.Float),
+    sa.Column("driver_circuit_affinity", sa.Float),
+    sa.Column("car_circuit_compatibility", sa.Float),
+    sa.Column("weather_adjusted_pace", sa.Float),
+    sa.Column("wet_advantage_index", sa.Float),
+    sa.Column("risk_adjusted_strategy", sa.Float),
+    sa.Column("intra_team_competition_factor", sa.Float),
+    sa.Column("team_orders_adjustment", sa.Float),
+    sa.Column("motivational_boost", sa.Float),
+    sa.Column("expected_qualifying_position", sa.Float),
+    sa.Column("expected_race_pace", sa.Float),
+    sa.Column("win_probability_raw", sa.Float),
     sa.UniqueConstraint("race_id", "driver_id", name="uq_situational_features"),
 )
 
@@ -1911,6 +1922,9 @@ def extract_race_features(conn: sa.Connection, race_id: int, driver_id: int) -> 
             circuits.c.circuit_id,
             circuits.c.circuit_name,
             circuit_characteristics.c.safety_car_probability,
+            circuit_characteristics.c.overtaking_difficulty,
+            circuit_characteristics.c.tire_degradation_severity,
+            circuit_characteristics.c.track_evolution_factor,
         ).select_from(
             circuits.join(circuit_characteristics, circuits.c.circuit_id == circuit_characteristics.c.circuit_id, isouter=True)
         ),
@@ -1932,6 +1946,11 @@ def extract_race_features(conn: sa.Connection, race_id: int, driver_id: int) -> 
             team_features.c.team_id,
             team_features.c.momentum_score,
             team_features.c.performance_trend_last_5_races,
+            team_features.c.straight_line_speed_ranking,
+            team_features.c.overall_downforce_level,
+            team_features.c.strategy_success_rate,
+            team_features.c.historical_avg_points_at_circuit,
+            team_features.c.dnf_rate_last_10_races,
         ),
         conn,
     )
@@ -1941,6 +1960,12 @@ def extract_race_features(conn: sa.Connection, race_id: int, driver_id: int) -> 
             driver_features.c.driver_id,
             driver_features.c.recent_dnf_rate,
             driver_features.c.wet_weather_performance_multiplier,
+            driver_features.c.avg_finish_position_at_circuit,
+            driver_features.c.last_3_races_avg_position,
+            driver_features.c.overtaking_success_rate,
+            driver_features.c.tire_management_score,
+            driver_features.c.qualifying_pace_percentile,
+            driver_features.c.race_pace_percentile,
         ),
         conn,
     )
@@ -2038,6 +2063,7 @@ def extract_race_features(conn: sa.Connection, race_id: int, driver_id: int) -> 
     points_gap_prev = None
     mathematical_possible = None
     must_win = None
+    remaining_races = 0
     standings = (
         results_df[results_df["order_index"] <= order_index]
         .groupby("driver_id")["points"].sum()
@@ -2125,6 +2151,168 @@ def extract_race_features(conn: sa.Connection, race_id: int, driver_id: int) -> 
         power_unit_risk = (team_feature_row["dnf_rate_last_10_races"].iloc[0] or 0)
         regulation_adaptation = team_feature_row["momentum_score"].iloc[0]
 
+    driver_circuit_affinity = None
+    car_circuit_compatibility = None
+    weather_adjusted_pace = None
+    wet_advantage_index = None
+    risk_adjusted_strategy = None
+    intra_team_competition_factor = None
+    team_orders_adjustment = None
+    motivational_boost = None
+    expected_qualifying_position = None
+    expected_race_pace = None
+    win_probability_raw = None
+
+    avg_finish_at_circuit = (
+        driver_feature_row["avg_finish_position_at_circuit"].iloc[0]
+        if not driver_feature_row.empty
+        else None
+    )
+    recent_form = (
+        driver_feature_row["last_3_races_avg_position"].iloc[0]
+        if not driver_feature_row.empty
+        else None
+    )
+    overtaking_rate = (
+        driver_feature_row["overtaking_success_rate"].iloc[0]
+        if not driver_feature_row.empty
+        else None
+    )
+    tire_management = (
+        driver_feature_row["tire_management_score"].iloc[0]
+        if not driver_feature_row.empty
+        else None
+    )
+    qualifying_skill = (
+        driver_feature_row["qualifying_pace_percentile"].iloc[0]
+        if not driver_feature_row.empty
+        else None
+    )
+    race_skill = (
+        driver_feature_row["race_pace_percentile"].iloc[0]
+        if not driver_feature_row.empty
+        else None
+    )
+
+    circuit_characteristics_row = circuit_char_df[circuit_char_df["circuit_name"] == circuit_name]
+    overtaking_difficulty = None
+    tire_deg_severity = None
+    if not circuit_characteristics_row.empty:
+        overtaking_difficulty = circuit_characteristics_row["overtaking_difficulty"].iloc[0]
+        tire_deg_severity = circuit_characteristics_row["tire_degradation_severity"].iloc[0]
+
+    driver_style_match = None
+    if overtaking_rate is not None:
+        driver_style_match = overtaking_rate
+        if overtaking_difficulty is not None:
+            driver_style_match = overtaking_rate * (1 - min(1.0, overtaking_difficulty / 10))
+    if tire_deg_severity is not None and tire_management is not None:
+        tire_component = min(1.0, abs(tire_management) / (abs(tire_deg_severity) + 1))
+        driver_style_match = ((driver_style_match or 0) + tire_component) / 2
+    if wet_race_prob is not None and not driver_feature_row.empty:
+        wet_multiplier = driver_feature_row["wet_weather_performance_multiplier"].iloc[0]
+        if wet_multiplier is not None:
+            driver_style_match = ((driver_style_match or 0) + wet_multiplier * wet_race_prob) / 2
+
+    historical_perf_score = None
+    if avg_finish_at_circuit is not None and avg_finish_at_circuit > 0:
+        historical_perf_score = 1 / avg_finish_at_circuit
+    recent_form_score = None
+    if recent_form is not None and recent_form > 0:
+        recent_form_score = 1 / recent_form
+    if historical_perf_score is not None and recent_form_score is not None and driver_style_match is not None:
+        driver_circuit_affinity = (
+            historical_perf_score * 0.4
+            + driver_style_match * 0.3
+            + recent_form_score * 0.3
+        )
+
+    if not team_feature_row.empty:
+        downforce_match = 0.5
+        circuit_type = circuits_df.loc[circuit_name]["circuit_type"] if circuit_name in circuits_df.index else None
+        if circuit_type and team_feature_row["overall_downforce_level"].iloc[0]:
+            if circuit_type.lower() == "street" and team_feature_row["overall_downforce_level"].iloc[0] == "high":
+                downforce_match = 0.8
+            elif circuit_type.lower() == "permanent":
+                downforce_match = 0.7
+        power_advantage = team_feature_row["straight_line_speed_ranking"].iloc[0]
+        if power_advantage is not None:
+            power_advantage = power_advantage / 10
+        tire_management_team = team_feature_row["strategy_success_rate"].iloc[0]
+        historical_perf = team_feature_row["historical_avg_points_at_circuit"].iloc[0]
+        if historical_perf is not None:
+            historical_perf = min(1.0, historical_perf / 25)
+        car_circuit_compatibility = (
+            downforce_match * 0.35
+            + (power_advantage or 0) * 0.25
+            + (tire_management_team or 0) * 0.2
+            + (historical_perf or 0) * 0.2
+        )
+
+    if race_skill is not None and wet_race_prob is not None:
+        wet_multiplier = driver_feature_row["wet_weather_performance_multiplier"].iloc[0] if not driver_feature_row.empty else 1
+        wet_pace = race_skill * (wet_multiplier or 1)
+        weather_adjusted_pace = race_skill * (1 - wet_race_prob) + wet_pace * wet_race_prob
+        field_avg_wet = driver_features_df[driver_features_df["race_id"] == race_id][
+            "wet_weather_performance_multiplier"
+        ].mean()
+        if wet_multiplier is not None and field_avg_wet is not None:
+            wet_advantage_index = (wet_multiplier - field_avg_wet) * wet_race_prob
+
+    championship_pressure = None
+    if points_gap_prev is not None and points_gap_next is not None and remaining_races >= 0:
+        pressure_gap = (points_gap_prev + points_gap_next) / max(1, remaining_races)
+        championship_pressure = min(1.0, max(0.0, pressure_gap / 50))
+    if optimal_tire_strategy:
+        optimal_value = {"1-stop": 1, "2-stop": 2, "3-stop": 3}.get(optimal_tire_strategy, 2)
+        aggressive_value = min(3, optimal_value + 1)
+        if championship_pressure is not None:
+            risk_adjusted_strategy = optimal_value * (1 - championship_pressure) + aggressive_value * championship_pressure
+
+    intra_team_competition_factor = team_orders_risk
+    if team_orders_risk is not None:
+        team_orders_adjustment = max(0.0, 1 - team_orders_risk)
+
+    if not driver_feature_row.empty:
+        motivational_boost = (driver_feature_row["last_3_races_avg_position"].iloc[0] or 0)
+        if motivational_boost:
+            motivational_boost = min(1.0, 1 / motivational_boost)
+
+    if qualifying_skill is not None:
+        car_perf = team_feature_row["momentum_score"].iloc[0] if not team_feature_row.empty else 0
+        circuit_match = car_circuit_compatibility or 0
+        weather_factor = 1 - (wet_race_prob or 0)
+        recent_form_factor = (1 / recent_form) if recent_form else 0
+        expected_qualifying_position = (
+            (1 - qualifying_skill) * 10
+            + (1 - car_perf) * 5
+            - circuit_match * 2
+            + (1 - weather_factor) * 2
+            - recent_form_factor * 2
+        )
+
+    if expected_qualifying_position is not None and race_skill is not None:
+        expected_race_pace = (
+            expected_qualifying_position * 0.4
+            + (1 - race_skill) * 10 * 0.4
+            + (1 - (tire_management or 0)) * 2 * 0.2
+        )
+
+    if expected_race_pace is not None and grid_position is not None:
+        reliability = 1 - (expected_dnf_rate or 0)
+        strategic_value = strategic_position_value or 0
+        win_probability_raw = max(
+            0.0,
+            min(
+                1.0,
+                (1 / (expected_race_pace + 1)) * 0.5
+                + (1 / (grid_position + 1)) * 0.2
+                + (safety_car_prob or 0) * 0.1
+                + reliability * 0.1
+                + (strategic_value / 10) * 0.1,
+            ),
+        )
+
     first_lap_incident_prob = None
     if safety_car_prob is not None or red_flag_prob is not None:
         base = [p for p in [safety_car_prob, red_flag_prob] if p is not None]
@@ -2164,6 +2352,17 @@ def extract_race_features(conn: sa.Connection, race_id: int, driver_id: int) -> 
         "overtake_mode_efficiency": overtake_efficiency,
         "new_power_unit_reliability_risk": power_unit_risk,
         "regulation_adaptation_success": regulation_adaptation,
+        "driver_circuit_affinity": driver_circuit_affinity,
+        "car_circuit_compatibility": car_circuit_compatibility,
+        "weather_adjusted_pace": weather_adjusted_pace,
+        "wet_advantage_index": wet_advantage_index,
+        "risk_adjusted_strategy": risk_adjusted_strategy,
+        "intra_team_competition_factor": intra_team_competition_factor,
+        "team_orders_adjustment": team_orders_adjustment,
+        "motivational_boost": motivational_boost,
+        "expected_qualifying_position": expected_qualifying_position,
+        "expected_race_pace": expected_race_pace,
+        "win_probability_raw": win_probability_raw,
     }
 
 
