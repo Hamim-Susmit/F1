@@ -141,6 +141,59 @@ race_weather_forecasts = sa.Table(
     sa.Column("source", sa.String),
 )
 
+circuits = sa.Table(
+    "circuits",
+    metadata,
+    sa.Column("circuit_id", sa.Integer, primary_key=True),
+    sa.Column("circuit_name", sa.String, nullable=False, unique=True),
+    sa.Column("country", sa.String),
+    sa.Column("circuit_length", sa.Float),
+    sa.Column("number_of_corners", sa.Integer),
+    sa.Column("longest_straight", sa.Float),
+    sa.Column("circuit_type", sa.String),
+    sa.Column("altitude", sa.Integer),
+    sa.Column("lap_record", sa.Float),
+    sa.Column("lap_record_holder", sa.String),
+    sa.Column("lap_record_year", sa.Integer),
+)
+
+circuit_characteristics = sa.Table(
+    "circuit_characteristics",
+    metadata,
+    sa.Column("char_id", sa.Integer, primary_key=True),
+    sa.Column("circuit_id", sa.Integer, sa.ForeignKey("circuits.circuit_id"), nullable=False),
+    sa.Column("high_speed_corners", sa.Integer),
+    sa.Column("medium_speed_corners", sa.Integer),
+    sa.Column("low_speed_corners", sa.Integer),
+    sa.Column("overtaking_difficulty", sa.Integer),
+    sa.Column("drs_zones", sa.Integer),
+    sa.Column("pit_lane_time_loss", sa.Float),
+    sa.Column("track_evolution_factor", sa.Float),
+    sa.Column("safety_car_probability", sa.Float),
+    sa.Column("average_pit_stops", sa.Float),
+    sa.Column("typical_strategy", sa.String),
+    sa.Column("overtaking_frequency", sa.Float),
+    sa.Column("grid_finish_correlation", sa.Float),
+    sa.Column("qualifying_importance", sa.Float),
+    sa.Column("tire_degradation_severity", sa.Float),
+    sa.Column("strategy_variation", sa.Float),
+    sa.UniqueConstraint("circuit_id", name="circuit_characteristics_circuit_id_key"),
+)
+
+circuit_history = sa.Table(
+    "circuit_history",
+    metadata,
+    sa.Column("history_id", sa.Integer, primary_key=True),
+    sa.Column("circuit_id", sa.Integer, sa.ForeignKey("circuits.circuit_id"), nullable=False),
+    sa.Column("season", sa.Integer, nullable=False),
+    sa.Column("pole_win_rate", sa.Float),
+    sa.Column("average_winning_margin", sa.Float),
+    sa.Column("safety_car_frequency", sa.Float),
+    sa.Column("red_flag_count", sa.Integer),
+    sa.Column("weather_variability", sa.Float),
+    sa.UniqueConstraint("circuit_id", "season", name="uq_circuit_history"),
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="FastF1 data ingester for PostgreSQL.")
@@ -263,6 +316,27 @@ def ensure_race(
             "winning_time": winning_time,
         },
     ).returning(races.c.race_id)
+    return conn.execute(stmt).scalar_one()
+
+
+def ensure_circuit(
+    conn,
+    circuit_name: str,
+    country: Optional[str],
+    circuit_type: Optional[str],
+) -> int:
+    stmt = pg_insert(circuits).values(
+        circuit_name=circuit_name,
+        country=country,
+        circuit_type=circuit_type,
+    )
+    stmt = stmt.on_conflict_do_update(
+        constraint="circuits_circuit_name_key",
+        set_={
+            "country": country,
+            "circuit_type": circuit_type,
+        },
+    ).returning(circuits.c.circuit_id)
     return conn.execute(stmt).scalar_one()
 
 
@@ -427,6 +501,9 @@ def build_data_quality_report(conn: sa.Connection) -> Dict[str, Any]:
             "pit_stops": count(pit_stops),
             "race_weather": count(race_weather),
             "race_weather_forecasts": count(race_weather_forecasts),
+            "circuits": count(circuits),
+            "circuit_characteristics": count(circuit_characteristics),
+            "circuit_history": count(circuit_history),
         },
         "missing_values": {
             "race_results_race_time": null_count(race_results, race_results.c.race_time),
@@ -434,6 +511,7 @@ def build_data_quality_report(conn: sa.Connection) -> Dict[str, Any]:
             "lap_times_lap_time": null_count(lap_times, lap_times.c.lap_time),
             "pit_stops_duration": null_count(pit_stops, pit_stops.c.duration),
             "race_weather_air_temp": null_count(race_weather, race_weather.c.air_temp),
+            "circuits_circuit_length": null_count(circuits, circuits.c.circuit_length),
         },
     }
     return report
@@ -677,6 +755,12 @@ def ingest_season(engine: Engine, season: int, sleep_time: float, weather_api_ke
                 race_date,
                 winning_time,
             )
+            ensure_circuit(
+                conn,
+                circuit_name,
+                event.get("Country"),
+                event.get("CircuitType"),
+            )
             lat = event.get("Latitude")
             lon = event.get("Longitude")
             sessions = get_session_times(event)
@@ -730,6 +814,333 @@ def ingest_season(engine: Engine, season: int, sleep_time: float, weather_api_ke
             time.sleep(sleep_time)
 
 
+def build_circuit_metrics(
+    conn: sa.Connection,
+) -> Tuple[pd.DataFrame, Dict[str, pd.DataFrame], pd.DataFrame]:
+    circuits_df = pd.read_sql(
+        sa.select(circuits.c.circuit_id, circuits.c.circuit_name),
+        conn,
+    )
+    races_df = pd.read_sql(
+        sa.select(
+            races.c.race_id,
+            races.c.circuit_name,
+            races.c.season,
+            races.c.race_date,
+        ),
+        conn,
+    )
+    results_df = pd.read_sql(
+        sa.select(
+            race_results.c.race_id,
+            race_results.c.driver_id,
+            race_results.c.grid_position,
+            race_results.c.finishing_position,
+            race_results.c.race_time,
+            race_results.c.status,
+        ),
+        conn,
+    )
+    qualifying_df = pd.read_sql(
+        sa.select(
+            qualifying_results.c.race_id,
+            qualifying_results.c.driver_id,
+            qualifying_results.c.grid_position.label("qualifying_position"),
+        ),
+        conn,
+    )
+    laps_df = pd.read_sql(
+        sa.select(
+            lap_times.c.race_id,
+            lap_times.c.driver_id,
+            lap_times.c.lap_number,
+            lap_times.c.lap_time,
+        ),
+        conn,
+    )
+    pits_df = pd.read_sql(
+        sa.select(
+            pit_stops.c.race_id,
+            pit_stops.c.driver_id,
+            pit_stops.c.stop_number,
+        ),
+        conn,
+    )
+    weather_df = pd.read_sql(
+        sa.select(
+            race_weather.c.race_id,
+            race_weather.c.air_temp,
+            race_weather.c.rain_probability,
+        ),
+        conn,
+    )
+    drivers_df = pd.read_sql(
+        sa.select(
+            drivers.c.driver_id,
+            drivers.c.full_name,
+        ),
+        conn,
+    )
+
+    results_df = results_df.merge(races_df, on="race_id", how="left")
+    qualifying_df = qualifying_df.merge(races_df, on="race_id", how="left")
+    laps_df = laps_df.merge(races_df, on="race_id", how="left")
+    pits_df = pits_df.merge(races_df, on="race_id", how="left")
+    weather_df = weather_df.merge(races_df, on="race_id", how="left")
+    laps_with_driver = laps_df.merge(drivers_df, on="driver_id", how="left")
+
+    return circuits_df, {
+        "races": races_df,
+        "results": results_df,
+        "qualifying": qualifying_df,
+        "laps": laps_df,
+        "pits": pits_df,
+        "weather": weather_df,
+        "laps_with_driver": laps_with_driver,
+    }, races_df
+
+
+def calculate_circuit_characteristics(
+    circuit_name: str,
+    data: Dict[str, pd.DataFrame],
+) -> Dict[str, Optional[float]]:
+    results_df = data["results"][data["results"]["circuit_name"] == circuit_name]
+    qualifying_df = data["qualifying"][data["qualifying"]["circuit_name"] == circuit_name]
+    laps_df = data["laps"][data["laps"]["circuit_name"] == circuit_name]
+    pits_df = data["pits"][data["pits"]["circuit_name"] == circuit_name]
+
+    overtaking_frequency = None
+    grid_finish_correlation = None
+    if not results_df.empty:
+        valid = results_df.dropna(subset=["grid_position", "finishing_position"])
+        if not valid.empty:
+            overtaking_frequency = (valid["finishing_position"] - valid["grid_position"]).abs().mean()
+            grid_finish_correlation = valid["grid_position"].corr(valid["finishing_position"])
+
+    qualifying_importance = None
+    if not results_df.empty and not qualifying_df.empty:
+        combined = results_df.merge(
+            qualifying_df,
+            on=["race_id", "driver_id"],
+            how="inner",
+        )
+        combined = combined.dropna(subset=["qualifying_position", "finishing_position"])
+        if not combined.empty:
+            qualifying_importance = combined["qualifying_position"].corr(combined["finishing_position"])
+
+    tire_degradation_severity = None
+    if not laps_df.empty:
+        lap_valid = laps_df.dropna(subset=["lap_time", "lap_number"])
+        if not lap_valid.empty:
+            lap_valid = lap_valid.sort_values(["race_id", "driver_id", "lap_number"])
+            first_last = lap_valid.groupby(["race_id", "driver_id"])["lap_time"].agg(["first", "last"])
+            if not first_last.empty:
+                tire_degradation_severity = (first_last["last"] - first_last["first"]).mean()
+
+    track_evolution_factor = None
+    if not laps_df.empty:
+        lap_valid = laps_df.dropna(subset=["lap_time", "lap_number"])
+        if not lap_valid.empty:
+            evolution_scores = []
+            for race_id, race_laps in lap_valid.groupby("race_id"):
+                max_lap = race_laps["lap_number"].max()
+                first_slice = race_laps[race_laps["lap_number"] <= 5]
+                last_slice = race_laps[race_laps["lap_number"] >= max_lap - 4]
+                if first_slice.empty or last_slice.empty:
+                    continue
+                first_mean = first_slice["lap_time"].mean()
+                last_mean = last_slice["lap_time"].mean()
+                if first_mean and first_mean > 0:
+                    evolution = (first_mean - last_mean) / first_mean
+                    evolution_scores.append(max(0.0, min(1.0, evolution)))
+            if evolution_scores:
+                track_evolution_factor = float(pd.Series(evolution_scores).mean())
+
+    safety_car_probability = None
+    if not results_df.empty:
+        safety_car_probability = (
+            results_df.groupby("race_id")["status"]
+            .apply(lambda s: s.fillna("").str.contains("Safety Car|SC|VSC", case=False).any())
+            .mean()
+        )
+
+    average_pit_stops = None
+    strategy_variation = None
+    if not pits_df.empty:
+        pit_counts = pits_df.groupby(["race_id", "driver_id"])["stop_number"].max().reset_index(name="pit_stops")
+        if not pit_counts.empty:
+            average_pit_stops = pit_counts["pit_stops"].mean()
+            variation_by_race = pit_counts.groupby("race_id")["pit_stops"].nunique()
+            strategy_variation = (variation_by_race > 1).mean()
+
+    typical_strategy = None
+    if average_pit_stops is not None:
+        if average_pit_stops <= 1.5:
+            typical_strategy = "1-stop"
+        elif average_pit_stops <= 2.5:
+            typical_strategy = "2-stop"
+        else:
+            typical_strategy = "variable"
+
+    overtaking_difficulty = None
+    if overtaking_frequency is not None:
+        scaled = 10 - min(9, int(round(overtaking_frequency)))
+        overtaking_difficulty = max(1, scaled)
+
+    return {
+        "overtaking_frequency": overtaking_frequency,
+        "grid_finish_correlation": grid_finish_correlation,
+        "qualifying_importance": qualifying_importance,
+        "tire_degradation_severity": tire_degradation_severity,
+        "strategy_variation": strategy_variation,
+        "average_pit_stops": average_pit_stops,
+        "typical_strategy": typical_strategy,
+        "overtaking_difficulty": overtaking_difficulty,
+        "track_evolution_factor": track_evolution_factor,
+        "safety_car_probability": safety_car_probability,
+    }
+
+
+def calculate_circuit_history(
+    circuit_name: str,
+    season: int,
+    data: Dict[str, pd.DataFrame],
+) -> Dict[str, Optional[float]]:
+    results_df = data["results"][
+        (data["results"]["circuit_name"] == circuit_name) & (data["results"]["season"] == season)
+    ]
+    races_df = data["races"][
+        (data["races"]["circuit_name"] == circuit_name) & (data["races"]["season"] == season)
+    ]
+    weather_df = data["weather"][
+        (data["weather"]["circuit_name"] == circuit_name) & (data["weather"]["season"] == season)
+    ]
+
+    pole_win_rate = None
+    average_winning_margin = None
+    safety_car_frequency = None
+    red_flag_count = None
+    weather_variability = None
+
+    if not results_df.empty:
+        winners = results_df[results_df["finishing_position"] == 1]
+        if not winners.empty:
+            pole_win_rate = (winners["grid_position"] == 1).mean()
+        race_times = results_df.pivot_table(
+            index="race_id",
+            columns="finishing_position",
+            values="race_time",
+            aggfunc="first",
+        )
+        if 1 in race_times and 2 in race_times:
+            margins = race_times[2] - race_times[1]
+            average_winning_margin = margins.dropna().mean()
+        safety_car_frequency = (
+            results_df.groupby("race_id")["status"]
+            .apply(lambda s: s.fillna("").str.contains("Safety Car|SC|VSC", case=False).any())
+            .mean()
+        )
+        red_flag_count = (
+            results_df.groupby("race_id")["status"]
+            .apply(lambda s: s.fillna("").str.contains("Red Flag", case=False).any())
+            .sum()
+        )
+
+    if not weather_df.empty:
+        variability = []
+        if weather_df["air_temp"].notna().any():
+            variability.append(weather_df["air_temp"].std())
+        if weather_df["rain_probability"].notna().any():
+            variability.append(weather_df["rain_probability"].std())
+        if variability:
+            weather_variability = float(pd.Series(variability).mean())
+
+    return {
+        "pole_win_rate": pole_win_rate,
+        "average_winning_margin": average_winning_margin,
+        "safety_car_frequency": safety_car_frequency,
+        "red_flag_count": red_flag_count,
+        "weather_variability": weather_variability,
+    }
+
+
+def update_circuit_tables(engine: Engine) -> None:
+    with engine.begin() as conn:
+        circuits_df, data, races_df = build_circuit_metrics(conn)
+
+        lap_records = None
+        if not data["laps_with_driver"].empty:
+            lap_records = (
+                data["laps_with_driver"]
+                .dropna(subset=["lap_time"])
+                .sort_values("lap_time")
+                .groupby("circuit_name")
+                .first()
+                .reset_index()
+            )
+
+        for _, circuit in circuits_df.iterrows():
+            circuit_id = circuit["circuit_id"]
+            circuit_name = circuit["circuit_name"]
+            metrics = calculate_circuit_characteristics(circuit_name, data)
+            lap_record = None
+            lap_record_holder = None
+            lap_record_year = None
+            if lap_records is not None and not lap_records.empty:
+                record_row = lap_records[lap_records["circuit_name"] == circuit_name]
+                if not record_row.empty:
+                    record_row = record_row.iloc[0]
+                    lap_record = record_row.get("lap_time")
+                    lap_record_holder = record_row.get("full_name")
+                    lap_record_year = record_row.get("season")
+
+            circuit_stmt = pg_insert(circuits).values(
+                circuit_id=circuit_id,
+                circuit_name=circuit_name,
+                lap_record=lap_record,
+                lap_record_holder=lap_record_holder,
+                lap_record_year=lap_record_year,
+            )
+            circuit_stmt = circuit_stmt.on_conflict_do_update(
+                constraint="circuits_circuit_name_key",
+                set_={
+                    "lap_record": lap_record,
+                    "lap_record_holder": lap_record_holder,
+                    "lap_record_year": lap_record_year,
+                },
+            )
+            conn.execute(circuit_stmt)
+
+            characteristics_stmt = pg_insert(circuit_characteristics).values(
+                circuit_id=circuit_id,
+                high_speed_corners=None,
+                medium_speed_corners=None,
+                low_speed_corners=None,
+                drs_zones=None,
+                pit_lane_time_loss=None,
+                **metrics,
+            )
+            characteristics_stmt = characteristics_stmt.on_conflict_do_update(
+                constraint="circuit_characteristics_circuit_id_key",
+                set_=metrics,
+            )
+            conn.execute(characteristics_stmt)
+
+            seasons = races_df[races_df["circuit_name"] == circuit_name]["season"].unique()
+            for season in seasons:
+                history = calculate_circuit_history(circuit_name, season, data)
+                history_stmt = pg_insert(circuit_history).values(
+                    circuit_id=circuit_id,
+                    season=int(season),
+                    **history,
+                )
+                history_stmt = history_stmt.on_conflict_do_update(
+                    constraint="uq_circuit_history",
+                    set_=history,
+                )
+                conn.execute(history_stmt)
+
+
 def main() -> None:
     setup_logging()
     args = parse_args()
@@ -739,6 +1150,7 @@ def main() -> None:
     for season in range(args.start_season, args.end_season + 1):
         LOG.info("Starting ingestion for season %s", season)
         ingest_season(engine, season, args.sleep, args.weather_api_key, args.weather_base_url)
+    update_circuit_tables(engine)
     with engine.begin() as conn:
         report = build_data_quality_report(conn)
     report_path = "data_quality_report.json"
