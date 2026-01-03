@@ -20,6 +20,8 @@ from imblearn.pipeline import Pipeline
 from sklearn.metrics import mean_absolute_error, mean_squared_error, roc_auc_score
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.utils.class_weight import compute_class_weight
+from sklearn.feature_selection import RFE
+from sklearn.inspection import permutation_importance
 from sklearn.metrics import mean_absolute_error, mean_squared_error, roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
@@ -573,6 +575,31 @@ def evaluate_models(
     explain_model(time_model, X, model_dir, "lgb_time")
     explain_model(dnf_model, X, model_dir, "xgb_dnf")
     explain_model(podium_model, X, model_dir, "xgb_podium")
+    critical_features = [
+        "grid_position",
+        "recent_form_weighted",
+        "circuit_historical_performance",
+        "team_performance_score",
+        "weather_impact_adjusted_pace",
+        "qualifying_gap_to_pole",
+        "reliability_score",
+    ]
+    pd.Series(critical_features).to_csv(
+        os.path.join(model_dir, "critical_features.csv"), index=False, header=False
+    )
+    importance_fold = fold_indices[-1] if fold_indices else None
+    if importance_fold:
+        train_idx, val_idx, _ = importance_fold
+        X_train = X.iloc[train_idx]
+        y_train = y_position.iloc[train_idx]
+        X_val = X.iloc[val_idx]
+        y_val = y_position.iloc[val_idx]
+        sample_size = min(2000, len(X_train))
+        X_sample = X_train.sample(sample_size, random_state=42)
+        y_sample = y_train.loc[X_sample.index]
+        save_shap_feature_importance(position_model, X_sample, model_dir, "xgb_position")
+        run_rfe(position_model, X_sample, y_sample, model_dir, "xgb_position")
+        save_permutation_importance(position_model, X_val, y_val, model_dir, "xgb_position")
     save_rf_feature_importance(rf_position_model, X, model_dir, "rf_position")
     save_rf_feature_importance(rf_time_model, X, model_dir, "rf_time")
     save_rf_feature_importance(rf_winner_model, X, model_dir, "rf_winner")
@@ -583,6 +610,63 @@ def explain_model(model, X: pd.DataFrame, model_dir: str, name: str) -> None:
     shap_values = explainer.shap_values(X)
     summary_path = os.path.join(model_dir, f"{name}_shap_summary.npy")
     np.save(summary_path, shap_values)
+
+
+def save_shap_feature_importance(
+    model,
+    X: pd.DataFrame,
+    model_dir: str,
+    name: str,
+    top_n: int = 20,
+) -> None:
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X)
+    if isinstance(shap_values, list):
+        shap_matrix = np.mean([np.abs(values) for values in shap_values], axis=0)
+    else:
+        shap_matrix = np.abs(shap_values)
+    importance = pd.DataFrame(
+        {"feature": X.columns, "importance": shap_matrix.mean(axis=0)}
+    ).sort_values("importance", ascending=False)
+    importance.head(top_n).to_csv(
+        os.path.join(model_dir, f"{name}_shap_top{top_n}.csv"), index=False
+    )
+
+
+def run_rfe(
+    model,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    model_dir: str,
+    name: str,
+    n_features: int = 50,
+) -> List[str]:
+    rfe = RFE(estimator=model, n_features_to_select=n_features)
+    rfe.fit(X_train, y_train)
+    selected = [f for f, keep in zip(X_train.columns, rfe.support_) if keep]
+    pd.Series(selected).to_csv(
+        os.path.join(model_dir, f"{name}_rfe_selected.csv"), index=False, header=False
+    )
+    return selected
+
+
+def save_permutation_importance(
+    model,
+    X_val: pd.DataFrame,
+    y_val: pd.Series,
+    model_dir: str,
+    name: str,
+    n_repeats: int = 10,
+) -> None:
+    result = permutation_importance(
+        model, X_val, y_val, n_repeats=n_repeats, random_state=42, n_jobs=-1
+    )
+    importance = pd.DataFrame(
+        {"feature": X_val.columns, "importance": result.importances_mean}
+    ).sort_values("importance", ascending=False)
+    importance.to_csv(
+        os.path.join(model_dir, f"{name}_permutation_importance.csv"), index=False
+    )
 
 
 def save_rf_feature_importance(model, X: pd.DataFrame, model_dir: str, name: str) -> None:
