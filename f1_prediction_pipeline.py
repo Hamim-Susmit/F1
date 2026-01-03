@@ -10,6 +10,8 @@ import pandas as pd
 import shap
 import sqlalchemy as sa
 from tensorflow import keras
+from scipy.stats import spearmanr
+from sklearn.metrics import accuracy_score, brier_score_loss
 
 from f1_data_ingest import extract_race_features
 
@@ -538,3 +540,101 @@ class ScenarioSimulator:
                 for scenario, preds in results.items()
             }
         return comparison
+
+
+class ModelEvaluator:
+    def __init__(self) -> None:
+        self.metrics_history: List[Dict[str, Any]] = []
+
+    def evaluate_predictions(
+        self,
+        predicted: List[Dict[str, Any]],
+        actual: List[Dict[str, Any]],
+        season: int,
+        race_id: int,
+    ) -> Dict[str, Any]:
+        metrics: Dict[str, Any] = {
+            "season": season,
+            "race_id": race_id,
+        }
+
+        metrics["winner_correct"] = predicted[0]["driver"] == actual[0]["driver"]
+
+        pred_podium = {p["driver"] for p in predicted[:3]}
+        actual_podium = {a["driver"] for a in actual[:3]}
+        metrics["top3_accuracy"] = len(pred_podium & actual_podium) / 3
+
+        pred_points = {p["driver"] for p in predicted[:10]}
+        actual_points = {a["driver"] for a in actual[:10]}
+        metrics["top10_accuracy"] = len(pred_points & actual_points) / 10
+
+        actual_by_driver = {a["driver"]: a for a in actual}
+        position_errors = []
+        dnf_actual = []
+        dnf_predictions = []
+        win_actual = []
+        win_probs = []
+
+        for pred in predicted:
+            driver = pred["driver"]
+            actual_row = actual_by_driver.get(driver)
+            if actual_row:
+                position_errors.append(abs(pred["position"] - actual_row["position"]))
+                dnf_actual.append(bool(actual_row.get("dnf")))
+                dnf_predictions.append(pred["dnf_probability"] > 0.5)
+                win_actual.append(1 if actual_row["position"] == 1 else 0)
+                win_probs.append(float(pred.get("win_probability", 0.0)))
+
+        metrics["position_mae"] = float(np.mean(position_errors)) if position_errors else 0.0
+
+        pred_order = [p["driver"] for p in predicted]
+        actual_order = [a["driver"] for a in actual]
+        pred_ranks = [pred_order.index(d) + 1 for d in actual_order if d in pred_order]
+        actual_ranks = list(range(1, len(pred_ranks) + 1))
+        if pred_ranks:
+            metrics["spearman_corr"] = float(spearmanr(pred_ranks, actual_ranks)[0])
+        else:
+            metrics["spearman_corr"] = 0.0
+
+        if dnf_actual:
+            metrics["dnf_accuracy"] = float(accuracy_score(dnf_actual, dnf_predictions))
+        else:
+            metrics["dnf_accuracy"] = 0.0
+
+        if win_actual:
+            metrics["brier_score"] = float(brier_score_loss(win_actual, win_probs))
+        else:
+            metrics["brier_score"] = 0.0
+
+        self.metrics_history.append(metrics)
+        return metrics
+
+    def generate_report(self, season: int = 2026) -> Dict[str, Any]:
+        season_metrics = [m for m in self.metrics_history if m["season"] == season]
+        if not season_metrics:
+            return {
+                "season": season,
+                "winner_accuracy": 0.0,
+                "top3_accuracy": 0.0,
+                "top10_accuracy": 0.0,
+                "avg_position_mae": 0.0,
+                "avg_spearman": 0.0,
+                "total_races": 0,
+            }
+        return {
+            "season": season,
+            "winner_accuracy": float(
+                np.mean([m["winner_correct"] for m in season_metrics])
+            ),
+            "top3_accuracy": float(np.mean([m["top3_accuracy"] for m in season_metrics])),
+            "top10_accuracy": float(
+                np.mean([m["top10_accuracy"] for m in season_metrics])
+            ),
+            "avg_position_mae": float(
+                np.mean([m["position_mae"] for m in season_metrics])
+            ),
+            "avg_spearman": float(
+                np.mean([m["spearman_corr"] for m in season_metrics])
+            ),
+            "total_races": len(season_metrics),
+        }
