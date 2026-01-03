@@ -159,15 +159,15 @@ def tune_xgb_position(
     def objective(trial: optuna.Trial) -> float:
         params = {
             "objective": "reg:squarederror",
-            "n_estimators": trial.suggest_int("n_estimators", 200, 600),
-            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1),
-            "max_depth": trial.suggest_int("max_depth", 4, 9),
-            "min_child_weight": trial.suggest_int("min_child_weight", 1, 5),
-            "subsample": trial.suggest_float("subsample", 0.6, 0.9),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 0.9),
-            "gamma": trial.suggest_float("gamma", 0.0, 0.2),
-            "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 0.3),
-            "reg_lambda": trial.suggest_float("reg_lambda", 0.5, 1.5),
+            "n_estimators": trial.suggest_int("n_estimators", 100, 1000),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "max_depth": trial.suggest_int("max_depth", 3, 12),
+            "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
+            "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
+            "gamma": trial.suggest_float("gamma", 0.0, 1.0),
+            "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 1.0),
+            "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 10.0),
             "random_state": 42,
         }
         scores = []
@@ -175,7 +175,7 @@ def tune_xgb_position(
             model = xgb.XGBRegressor(**params)
             model.fit(X.iloc[train_idx], y.iloc[train_idx])
             preds = model.predict(X.iloc[test_idx])
-            scores.append(mean_squared_error(y.iloc[test_idx], preds))
+            scores.append(mean_absolute_error(y.iloc[test_idx], preds))
         return float(np.mean(scores))
 
     study = optuna.create_study(direction="minimize")
