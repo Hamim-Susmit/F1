@@ -238,6 +238,38 @@ driver_features = sa.Table(
     sa.UniqueConstraint("race_id", "driver_id", name="uq_driver_features"),
 )
 
+team_features = sa.Table(
+    "team_features",
+    metadata,
+    sa.Column("feature_id", sa.Integer, primary_key=True),
+    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
+    sa.Column("team_id", sa.Integer, sa.ForeignKey("teams.team_id"), nullable=False),
+    sa.Column("performance_trend_last_5_races", sa.Float),
+    sa.Column("points_per_race_last_3_vs_previous_3", sa.Float),
+    sa.Column("constructor_position_change", sa.Float),
+    sa.Column("upgrades_impact_score", sa.Float),
+    sa.Column("dnf_rate_last_10_races", sa.Float),
+    sa.Column("mechanical_dnf_rate", sa.Float),
+    sa.Column("races_both_cars_finished", sa.Float),
+    sa.Column("engine_penalty_frequency", sa.Float),
+    sa.Column("straight_line_speed_ranking", sa.Float),
+    sa.Column("high_speed_corner_ranking", sa.Float),
+    sa.Column("low_speed_corner_ranking", sa.Float),
+    sa.Column("overall_downforce_level", sa.String),
+    sa.Column("tire_wear_rate", sa.String),
+    sa.Column("qualifying_vs_race_pace_balance", sa.Float),
+    sa.Column("team_performance_at_circuit_type", sa.Float),
+    sa.Column("historical_avg_points_at_circuit", sa.Float),
+    sa.Column("best_finish_at_circuit", sa.Float),
+    sa.Column("car_characteristics_circuit_match_score", sa.Float),
+    sa.Column("avg_pit_stop_duration", sa.Float),
+    sa.Column("pit_stop_consistency", sa.Float),
+    sa.Column("strategy_success_rate", sa.Float),
+    sa.Column("team_orders_likelihood", sa.Float),
+    sa.Column("momentum_score", sa.Float),
+    sa.UniqueConstraint("race_id", "team_id", name="uq_team_features"),
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="FastF1 data ingester for PostgreSQL.")
@@ -549,6 +581,7 @@ def build_data_quality_report(conn: sa.Connection) -> Dict[str, Any]:
             "circuit_characteristics": count(circuit_characteristics),
             "circuit_history": count(circuit_history),
             "driver_features": count(driver_features),
+            "team_features": count(team_features),
         },
         "missing_values": {
             "race_results_race_time": null_count(race_results, race_results.c.race_time),
@@ -559,6 +592,9 @@ def build_data_quality_report(conn: sa.Connection) -> Dict[str, Any]:
             "circuits_circuit_length": null_count(circuits, circuits.c.circuit_length),
             "driver_features_last_3_avg": null_count(
                 driver_features, driver_features.c.last_3_races_avg_position
+            ),
+            "team_features_momentum": null_count(
+                team_features, team_features.c.momentum_score
             ),
         },
     }
@@ -1518,6 +1554,259 @@ def update_driver_features(engine: Engine, lookback_period: int = 10) -> None:
                 conn.execute(stmt)
 
 
+def calculate_team_features(
+    conn: sa.Connection,
+    team_id: int,
+    target_race_id: int,
+    lookback_period: int,
+) -> Dict[str, Any]:
+    races_df = pd.read_sql(
+        sa.select(races.c.race_id, races.c.season, races.c.round, races.c.circuit_name),
+        conn,
+    )
+    races_df = races_df.sort_values(["season", "round"]).reset_index(drop=True)
+    races_df["order_index"] = range(len(races_df))
+    results_df = pd.read_sql(
+        sa.select(
+            race_results.c.race_id,
+            race_results.c.driver_id,
+            race_results.c.team_id,
+            race_results.c.grid_position,
+            race_results.c.finishing_position,
+            race_results.c.points,
+            race_results.c.status,
+        ),
+        conn,
+    )
+    qualifying_df = pd.read_sql(
+        sa.select(
+            qualifying_results.c.race_id,
+            qualifying_results.c.driver_id,
+            qualifying_results.c.grid_position.label("qualifying_position"),
+        ),
+        conn,
+    )
+    pit_df = pd.read_sql(
+        sa.select(
+            pit_stops.c.race_id,
+            pit_stops.c.driver_id,
+            pit_stops.c.duration,
+        ),
+        conn,
+    )
+    circuits_df = pd.read_sql(
+        sa.select(circuits.c.circuit_name, circuits.c.circuit_type),
+        conn,
+    )
+
+    target_race = races_df[races_df["race_id"] == target_race_id]
+    if target_race.empty:
+        return {}
+    target_order = target_race.iloc[0]["order_index"]
+    target_circuit = target_race.iloc[0]["circuit_name"]
+
+    results_df = results_df.merge(races_df, on="race_id", how="left")
+    qualifying_df = qualifying_df.merge(races_df, on="race_id", how="left")
+    pit_df = pit_df.merge(races_df, on="race_id", how="left")
+    circuits_df = circuits_df.set_index("circuit_name")
+
+    team_results = results_df[(results_df["team_id"] == team_id) & (results_df["order_index"] <= target_order)]
+    recent_results = team_results.sort_values(["season", "round"]).tail(lookback_period)
+
+    points_by_race = recent_results.groupby("race_id")["points"].sum()
+    performance_trend = None
+    if len(points_by_race) >= 2:
+        x = pd.Series(range(len(points_by_race)), dtype=float)
+        y = points_by_race.reset_index(drop=True).astype(float)
+        performance_trend = float(pd.Series(y).corr(pd.Series(x)) or 0) * y.std()
+
+    points_last3 = points_by_race.tail(3).mean() if len(points_by_race) >= 3 else None
+    points_prev3 = points_by_race.tail(6).head(3).mean() if len(points_by_race) >= 6 else None
+    points_delta = None
+    if points_last3 is not None and points_prev3 is not None:
+        points_delta = points_last3 - points_prev3
+
+    constructor_change = None
+    if len(points_by_race) >= 5:
+        recent_rank = points_by_race.rank(ascending=False).iloc[-1]
+        past_rank = points_by_race.rank(ascending=False).iloc[-5]
+        constructor_change = float(past_rank - recent_rank)
+
+    upgrades_impact = None
+    if len(points_by_race) >= 2:
+        upgrades_impact = points_by_race.diff().mean()
+
+    dnf_rate = None
+    mechanical_dnf = None
+    if not recent_results.empty:
+        dnf_mask = recent_results["status"].fillna("").str.contains("DNF|DNS|DSQ|Ret", case=False)
+        dnf_rate = dnf_mask.mean()
+        mechanical_mask = recent_results["status"].fillna("").str.contains(
+            "Engine|Gearbox|Hydraulic|Mechanical|Power|ERS", case=False
+        )
+        mechanical_dnf = mechanical_mask.mean()
+
+    races_both_finished = None
+    if not recent_results.empty:
+        finish_by_race = (
+            recent_results.groupby("race_id")["status"]
+            .apply(lambda s: (~s.fillna("").str.contains("DNF|DNS|DSQ|Ret", case=False)).all())
+        )
+        races_both_finished = finish_by_race.mean()
+
+    engine_penalty_frequency = (
+        recent_results["status"].fillna("").str.contains("Penalty", case=False).mean()
+        if not recent_results.empty
+        else None
+    )
+
+    qualifying_balance = None
+    if not recent_results.empty:
+        team_qual = qualifying_df[
+            (qualifying_df["race_id"].isin(recent_results["race_id"])) &
+            (qualifying_df["driver_id"].isin(recent_results["driver_id"]))
+        ]
+        if not team_qual.empty:
+            qual_avg = team_qual["qualifying_position"].mean()
+            race_avg = recent_results["finishing_position"].mean()
+            if qual_avg is not None and race_avg is not None:
+                qualifying_balance = qual_avg - race_avg
+
+    straight_line_speed = None
+    high_speed_corner = None
+    low_speed_corner = None
+    if not recent_results.empty:
+        avg_finish = recent_results["finishing_position"].mean()
+        if avg_finish is not None:
+            rank_score = max(1, 11 - int(round(avg_finish)))
+            straight_line_speed = rank_score
+            high_speed_corner = rank_score
+            low_speed_corner = rank_score
+
+    overall_downforce = None
+    if high_speed_corner is not None and low_speed_corner is not None:
+        overall_downforce = "high" if high_speed_corner >= low_speed_corner else "medium"
+
+    tire_wear = None
+    if not recent_results.empty:
+        tire_wear = "neutral"
+
+    circuit_type = circuits_df.loc[target_circuit]["circuit_type"] if target_circuit in circuits_df.index else None
+    team_perf_circuit_type = None
+    if circuit_type:
+        circuit_races = results_df[
+            (results_df["team_id"] == team_id) &
+            (results_df["order_index"] <= target_order)
+        ].merge(circuits_df, left_on="circuit_name", right_index=True, how="left")
+        subset = circuit_races[circuit_races["circuit_type"] == circuit_type]
+        if not subset.empty:
+            team_perf_circuit_type = subset["points"].mean()
+
+    historical_avg_points = None
+    best_finish = None
+    circuit_history = results_df[
+        (results_df["team_id"] == team_id)
+        & (results_df["circuit_name"] == target_circuit)
+        & (results_df["season"] >= target_race.iloc[0]["season"] - 5)
+    ]
+    if not circuit_history.empty:
+        historical_avg_points = circuit_history["points"].mean()
+        best_finish = circuit_history["finishing_position"].min()
+
+    match_score = None
+    if circuit_type:
+        if overall_downforce == "high" and circuit_type == "Permanent":
+            match_score = 0.8
+        elif overall_downforce == "high" and circuit_type == "Street":
+            match_score = 0.6
+        elif overall_downforce == "medium":
+            match_score = 0.5
+
+    pit_recent = pit_df[
+        (pit_df["race_id"].isin(recent_results["race_id"])) &
+        (pit_df["driver_id"].isin(recent_results["driver_id"]))
+    ]
+    avg_pit_duration = pit_recent["duration"].mean() if not pit_recent.empty else None
+    pit_consistency = pit_recent["duration"].std() if not pit_recent.empty else None
+
+    strategy_success = None
+    if avg_pit_duration is not None:
+        strategy_success = 1 - min(1.0, avg_pit_duration / 5.0)
+
+    team_orders = None
+    if not recent_results.empty:
+        team_orders = (recent_results["finishing_position"].diff().abs() < 1).mean()
+
+    reliability_score = None
+    if dnf_rate is not None:
+        reliability_score = 1 - dnf_rate
+
+    momentum_score = None
+    if points_last3 is not None and performance_trend is not None and reliability_score is not None:
+        recent_performance = points_last3 / 25 if points_last3 else 0
+        development_rate = performance_trend / 10 if performance_trend else 0
+        driver_perf_avg = recent_results["finishing_position"].mean() if not recent_results.empty else 0
+        driver_perf_avg = 1 - (driver_perf_avg / 20) if driver_perf_avg else 0
+        team_morale_proxy = races_both_finished if races_both_finished is not None else 0
+        momentum_score = (
+            recent_performance * 0.3
+            + development_rate * 0.25
+            + reliability_score * 0.2
+            + driver_perf_avg * 0.15
+            + team_morale_proxy * 0.1
+        )
+
+    return {
+        "performance_trend_last_5_races": performance_trend,
+        "points_per_race_last_3_vs_previous_3": points_delta,
+        "constructor_position_change": constructor_change,
+        "upgrades_impact_score": upgrades_impact,
+        "dnf_rate_last_10_races": dnf_rate,
+        "mechanical_dnf_rate": mechanical_dnf,
+        "races_both_cars_finished": races_both_finished,
+        "engine_penalty_frequency": engine_penalty_frequency,
+        "straight_line_speed_ranking": straight_line_speed,
+        "high_speed_corner_ranking": high_speed_corner,
+        "low_speed_corner_ranking": low_speed_corner,
+        "overall_downforce_level": overall_downforce,
+        "tire_wear_rate": tire_wear,
+        "qualifying_vs_race_pace_balance": qualifying_balance,
+        "team_performance_at_circuit_type": team_perf_circuit_type,
+        "historical_avg_points_at_circuit": historical_avg_points,
+        "best_finish_at_circuit": best_finish,
+        "car_characteristics_circuit_match_score": match_score,
+        "avg_pit_stop_duration": avg_pit_duration,
+        "pit_stop_consistency": pit_consistency,
+        "strategy_success_rate": strategy_success,
+        "team_orders_likelihood": team_orders,
+        "momentum_score": momentum_score,
+    }
+
+
+def update_team_features(engine: Engine, lookback_period: int = 10) -> None:
+    with engine.begin() as conn:
+        races_df = pd.read_sql(
+            sa.select(races.c.race_id, races.c.season, races.c.round).order_by(races.c.season, races.c.round),
+            conn,
+        )
+        team_ids = pd.read_sql(sa.select(teams.c.team_id), conn)["team_id"].tolist()
+        for race_id in races_df["race_id"].tolist():
+            for team_id in team_ids:
+                feature_values = calculate_team_features(conn, team_id, race_id, lookback_period)
+                if not feature_values:
+                    continue
+                stmt = pg_insert(team_features).values(
+                    race_id=race_id,
+                    team_id=team_id,
+                    **feature_values,
+                )
+                stmt = stmt.on_conflict_do_update(
+                    constraint="uq_team_features",
+                    set_=feature_values,
+                )
+                conn.execute(stmt)
+
+
 def main() -> None:
     setup_logging()
     args = parse_args()
@@ -1529,6 +1818,7 @@ def main() -> None:
         ingest_season(engine, season, args.sleep, args.weather_api_key, args.weather_base_url)
     update_circuit_tables(engine)
     update_driver_features(engine)
+    update_team_features(engine)
     with engine.begin() as conn:
         report = build_data_quality_report(conn)
     report_path = "data_quality_report.json"
