@@ -13,6 +13,7 @@ import xgboost as xgb
 import lightgbm as lgb
 from sklearn.metrics import mean_absolute_error, mean_squared_error, roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 
 
 LOG = logging.getLogger("f1_models")
@@ -71,6 +72,7 @@ def prepare_targets(df: pd.DataFrame) -> pd.DataFrame:
     winner_time = df.groupby("race_id")["race_time"].transform("min")
     df["race_time_delta"] = df["race_time"] - winner_time
     df["dnf"] = df["status"].fillna("").str.contains("DNF|DNS|DSQ|Ret", case=False)
+    df["winner"] = df["finishing_position"] == 1
     df["podium_class"] = pd.cut(
         df["finishing_position"],
         bins=[0, 1, 2, 3, 10, 20],
@@ -97,6 +99,7 @@ def select_features(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
             "round",
             "order_index",
             "dnf",
+            "winner",
             "podium_class",
         }
     ]
@@ -212,12 +215,45 @@ def train_xgb_podium(X: pd.DataFrame, y: pd.Series) -> xgb.XGBClassifier:
     return model
 
 
+def train_rf_regressor(X: pd.DataFrame, y: pd.Series) -> RandomForestRegressor:
+    params = {
+        "n_estimators": 300,
+        "max_depth": 15,
+        "min_samples_split": 10,
+        "min_samples_leaf": 4,
+        "max_features": "sqrt",
+        "bootstrap": True,
+        "random_state": 42,
+        "n_jobs": -1,
+    }
+    model = RandomForestRegressor(**params)
+    model.fit(X, y)
+    return model
+
+
+def train_rf_classifier(X: pd.DataFrame, y: pd.Series) -> RandomForestClassifier:
+    params = {
+        "n_estimators": 300,
+        "max_depth": 15,
+        "min_samples_split": 10,
+        "min_samples_leaf": 4,
+        "max_features": "sqrt",
+        "bootstrap": True,
+        "random_state": 42,
+        "n_jobs": -1,
+    }
+    model = RandomForestClassifier(**params)
+    model.fit(X, y)
+    return model
+
+
 def evaluate_models(
     X: pd.DataFrame,
     y_position: pd.Series,
     y_time: pd.Series,
     y_dnf: pd.Series,
     y_podium: pd.Series,
+    y_winner: pd.Series,
     model_dir: str,
     n_splits: int,
     optuna_trials: int,
@@ -233,26 +269,46 @@ def evaluate_models(
     time_model = train_lgb_time(X, y_time, lgb_params)
     dnf_model = train_xgb_dnf(X, y_dnf)
     podium_model = train_xgb_podium(X, y_podium)
+    rf_position_model = train_rf_regressor(X, y_position)
+    rf_time_model = train_rf_regressor(X, y_time)
+    rf_winner_model = train_rf_classifier(X, y_winner)
 
     joblib.dump(position_model, os.path.join(model_dir, "xgb_position.joblib"))
     joblib.dump(time_model, os.path.join(model_dir, "lgb_time.joblib"))
     joblib.dump(dnf_model, os.path.join(model_dir, "xgb_dnf.joblib"))
     joblib.dump(podium_model, os.path.join(model_dir, "xgb_podium.joblib"))
+    joblib.dump(rf_position_model, os.path.join(model_dir, "rf_position.joblib"))
+    joblib.dump(rf_time_model, os.path.join(model_dir, "rf_time.joblib"))
+    joblib.dump(rf_winner_model, os.path.join(model_dir, "rf_winner.joblib"))
 
     position_preds = position_model.predict(X)
     time_preds = time_model.predict(X)
     dnf_preds = dnf_model.predict_proba(X)[:, 1]
     podium_preds = podium_model.predict_proba(X)
+    rf_position_preds = rf_position_model.predict(X)
+    rf_time_preds = rf_time_model.predict(X)
+    rf_winner_preds = rf_winner_model.predict_proba(X)[:, 1]
 
     LOG.info("Position RMSE: %.3f", mean_squared_error(y_position, position_preds, squared=False))
     LOG.info("Time MAE: %.3f", mean_absolute_error(y_time, time_preds))
     LOG.info("DNF ROC-AUC: %.3f", roc_auc_score(y_dnf, dnf_preds))
     LOG.info("Podium Class MAE: %.3f", mean_absolute_error(y_podium, podium_preds.argmax(axis=1)))
+    LOG.info("RF Position RMSE: %.3f", mean_squared_error(y_position, rf_position_preds, squared=False))
+    LOG.info("RF Time MAE: %.3f", mean_absolute_error(y_time, rf_time_preds))
+    LOG.info("RF Winner ROC-AUC: %.3f", roc_auc_score(y_winner, rf_winner_preds))
+
+    ensemble_position = 0.35 * position_preds + 0.25 * rf_position_preds
+    ensemble_time = 0.30 * time_preds + 0.25 * rf_time_preds
+    LOG.info("Ensemble Position RMSE: %.3f", mean_squared_error(y_position, ensemble_position, squared=False))
+    LOG.info("Ensemble Time MAE: %.3f", mean_absolute_error(y_time, ensemble_time))
 
     explain_model(position_model, X, model_dir, "xgb_position")
     explain_model(time_model, X, model_dir, "lgb_time")
     explain_model(dnf_model, X, model_dir, "xgb_dnf")
     explain_model(podium_model, X, model_dir, "xgb_podium")
+    save_rf_feature_importance(rf_position_model, X, model_dir, "rf_position")
+    save_rf_feature_importance(rf_time_model, X, model_dir, "rf_time")
+    save_rf_feature_importance(rf_winner_model, X, model_dir, "rf_winner")
 
 
 def explain_model(model, X: pd.DataFrame, model_dir: str, name: str) -> None:
@@ -260,6 +316,12 @@ def explain_model(model, X: pd.DataFrame, model_dir: str, name: str) -> None:
     shap_values = explainer.shap_values(X)
     summary_path = os.path.join(model_dir, f"{name}_shap_summary.npy")
     np.save(summary_path, shap_values)
+
+
+def save_rf_feature_importance(model, X: pd.DataFrame, model_dir: str, name: str) -> None:
+    importance = pd.Series(model.feature_importances_, index=X.columns).sort_values(ascending=False)
+    importance_path = os.path.join(model_dir, f"{name}_feature_importance.csv")
+    importance.to_csv(importance_path, header=["importance"])
 
 
 def main() -> None:
@@ -276,6 +338,7 @@ def main() -> None:
         df["race_time_delta"],
         df["dnf"].astype(int),
         df["podium_class"].astype(int),
+        df["winner"].astype(int),
         args.model_dir,
         args.n_splits,
         args.optuna_trials,
