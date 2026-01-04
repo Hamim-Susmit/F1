@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import json
 import os
+import re
 from typing import Any, Dict, List
 
 import joblib
@@ -70,7 +71,42 @@ class F1RacePredictor:
             raise ValueError(f"Unknown scenario '{scenario}'")
         self.weather_override = scenarios[scenario]
 
-    def get_race_info(self, race_id: int) -> Dict[str, Any]:
+    def normalize_race_id(self, race_id: int | str) -> int:
+        if isinstance(race_id, int):
+            return race_id
+        if isinstance(race_id, str):
+            if race_id.isdigit():
+                return int(race_id)
+            match = re.match(
+                r"^(?P<season>\d{4})_R(?P<round>\d+)(?:_(?P<name>.+))?$",
+                race_id,
+            )
+            if match:
+                season = int(match.group("season"))
+                round_number = int(match.group("round"))
+                name_hint = match.group("name")
+                name_clause = ""
+                params: Dict[str, Any] = {"season": season, "round": round_number}
+                if name_hint:
+                    name_clause = "AND race_name ILIKE :name_hint"
+                    params["name_hint"] = f"%{name_hint.replace('_', ' ')}%"
+                query = sa.text(
+                    f"""
+                    SELECT race_id
+                    FROM races
+                    WHERE season = :season AND round = :round {name_clause}
+                    ORDER BY race_id DESC
+                    LIMIT 1
+                    """
+                )
+                with self.engine.begin() as conn:
+                    row = conn.execute(query, params).scalar_one_or_none()
+                if row is not None:
+                    return int(row)
+        raise ValueError(f"Unrecognized race identifier: {race_id}")
+
+    def get_race_info(self, race_id: int | str) -> Dict[str, Any]:
+        race_id = self.normalize_race_id(race_id)
         query = sa.text(
             """
             SELECT race_id, season, round, race_name, circuit_name, race_date
@@ -84,7 +120,8 @@ class F1RacePredictor:
             raise ValueError(f"Race {race_id} not found")
         return dict(row)
 
-    def get_weather_forecast(self, race_id: int) -> Dict[str, Any]:
+    def get_weather_forecast(self, race_id: int | str) -> Dict[str, Any]:
+        race_id = self.normalize_race_id(race_id)
         if self.weather_override:
             return dict(self.weather_override)
         forecast_query = sa.text(
@@ -118,7 +155,8 @@ class F1RacePredictor:
             row = conn.execute(fallback_query, {"race_id": race_id}).mappings().first()
             return dict(row) if row else {}
 
-    def get_entry_list(self, race_id: int) -> List[Dict[str, Any]]:
+    def get_entry_list(self, race_id: int | str) -> List[Dict[str, Any]]:
+        race_id = self.normalize_race_id(race_id)
         race_results_query = sa.text(
             """
             SELECT rr.driver_id,
@@ -163,10 +201,11 @@ class F1RacePredictor:
 
     def predict_race(
         self,
-        race_id: int,
+        race_id: int | str,
         use_latest_data: bool = True,
         weather_override: Dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
+        race_id = self.normalize_race_id(race_id)
         race_info = self.get_race_info(race_id)
         weather_forecast = (
             dict(weather_override)
@@ -328,11 +367,12 @@ class LivePredictionUpdater:
 
     def update_from_practice(
         self,
-        race_id: int,
+        race_id: int | str,
         fp1_times: pd.DataFrame,
         fp2_times: pd.DataFrame,
         fp3_times: pd.DataFrame,
     ) -> Dict[str, Any]:
+        race_id = self.predictor.normalize_race_id(race_id)
         long_run_pace = self.analyze_practice_pace(fp2_times, fp3_times)
         for team, pace in long_run_pace.items():
             self.update_team_performance(team, pace)
@@ -341,8 +381,9 @@ class LivePredictionUpdater:
         return updated
 
     def update_from_qualifying(
-        self, race_id: int, quali_results: Dict[int, int]
+        self, race_id: int | str, quali_results: Dict[int, int]
     ) -> Dict[str, Any]:
+        race_id = self.predictor.normalize_race_id(race_id)
         for driver_id, grid_pos in quali_results.items():
             self.update_driver_grid(driver_id, grid_pos)
         updated = self.predictor.predict_race(race_id, use_latest_data=True)
@@ -350,8 +391,9 @@ class LivePredictionUpdater:
         return updated
 
     def update_from_weather_change(
-        self, race_id: int, new_forecast: Dict[str, Any]
+        self, race_id: int | str, new_forecast: Dict[str, Any]
     ) -> Dict[str, Any]:
+        race_id = self.predictor.normalize_race_id(race_id)
         current = self.cache.get(race_id)
         if current is None:
             updated = self.predictor.predict_race(race_id)
@@ -368,8 +410,9 @@ class LivePredictionUpdater:
         return current
 
     def post_race_learning(
-        self, race_id: int, actual_results: List[Dict[str, Any]]
+        self, race_id: int | str, actual_results: List[Dict[str, Any]]
     ) -> List[Dict[str, Any]] | None:
+        race_id = self.predictor.normalize_race_id(race_id)
         predicted = self.cache.get(race_id)
         if predicted is None:
             return None
@@ -447,7 +490,8 @@ class ScenarioSimulator:
     def __init__(self, predictor: F1RacePredictor) -> None:
         self.predictor = predictor
 
-    def simulate_weather_scenarios(self, race_id: int) -> Dict[str, Any]:
+    def simulate_weather_scenarios(self, race_id: int | str) -> Dict[str, Any]:
+        race_id = self.predictor.normalize_race_id(race_id)
         scenarios = {
             "dry": {"rain_probability": 0.0, "temp": 25},
             "mixed": {"rain_probability": 0.3, "temp": 22},
@@ -456,15 +500,14 @@ class ScenarioSimulator:
         }
         results = {}
         for scenario_name, weather in scenarios.items():
-            self.predictor.weather_override = weather
-            pred = self.predictor.predict_race(race_id)
+            pred = self.predictor.predict_race(race_id, weather_override=weather)
             results[scenario_name] = pred["predictions"]
-        self.predictor.weather_override = None
         return self.compare_scenarios(results)
 
     def simulate_grid_penalty(
-        self, race_id: int, driver_id: int, penalty_positions: int
+        self, race_id: int | str, driver_id: int, penalty_positions: int
     ) -> Dict[str, Any]:
+        race_id = self.predictor.normalize_race_id(race_id)
         base_pred = self.predictor.predict_race(race_id)
         entry_list = self.predictor.get_entry_list(race_id)
         entry = next((driver for driver in entry_list if driver["driver_id"] == driver_id), None)
@@ -477,7 +520,8 @@ class ScenarioSimulator:
         self.predictor.grid_overrides.pop(driver_id, None)
         return self.compare_predictions(base_pred, penalty_pred)
 
-    def simulate_dnf(self, race_id: int, driver_ids: List[int]) -> Dict[str, Any]:
+    def simulate_dnf(self, race_id: int | str, driver_ids: List[int]) -> Dict[str, Any]:
+        race_id = self.predictor.normalize_race_id(race_id)
         base_pred = self.predictor.predict_race(race_id)
         self.predictor.dnf_overrides = set(driver_ids)
         dnf_pred = self.predictor.predict_race(race_id)
@@ -485,15 +529,19 @@ class ScenarioSimulator:
         return self.compare_predictions(base_pred, dnf_pred)
 
     def simulate_team_upgrade(
-        self, race_id: int, team_name: str, performance_boost: float
+        self, race_id: int | str, team_name: str, performance_boost: float
     ) -> Dict[str, Any]:
+        race_id = self.predictor.normalize_race_id(race_id)
         base_pred = self.predictor.predict_race(race_id)
         self.predictor.team_performance_overrides[team_name] = performance_boost
         upgraded_pred = self.predictor.predict_race(race_id)
         self.predictor.team_performance_overrides.pop(team_name, None)
         return self.compare_predictions(base_pred, upgraded_pred)
 
-    def monte_carlo_simulation(self, race_id: int, n_simulations: int = 1000) -> Dict[str, Any]:
+    def monte_carlo_simulation(
+        self, race_id: int | str, n_simulations: int = 1000
+    ) -> Dict[str, Any]:
+        race_id = self.predictor.normalize_race_id(race_id)
         base_pred = self.predictor.predict_race(race_id)
         results = {pred["driver"]: [] for pred in base_pred["predictions"]}
         for _ in range(n_simulations):
