@@ -1,0 +1,66 @@
+name: F1 Prediction ML Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 0 * * 1"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
+
+      - name: Run tests
+        run: |
+          pytest tests/ --cov=src --cov-report=xml
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v3
+
+  train:
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name == 'schedule' || contains(github.event.head_commit.message, '[retrain]')
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Fetch latest data
+        run: python src/data/fetch_latest.py
+
+      - name: Train models
+        run: python src/models/train.py
+
+      - name: Evaluate models
+        run: python src/models/evaluate.py
+
+      - name: Compare with baseline
+        run: python src/models/compare.py
+
+      - name: Upload models to S3
+        if: success()
+        run: aws s3 sync ./models s3://f1-prediction-models/
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [test, train]
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Deploy to production
+        run: |
+          # Deploy Docker containers to cloud
+          # Update load balancer
+          # Run smoke tests
