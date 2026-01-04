@@ -161,9 +161,18 @@ class F1RacePredictor:
                 return [dict(row) for row in rows]
         raise ValueError(f"No entry list found for race {race_id}")
 
-    def predict_race(self, race_id: int, use_latest_data: bool = True) -> Dict[str, Any]:
+    def predict_race(
+        self,
+        race_id: int,
+        use_latest_data: bool = True,
+        weather_override: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
         race_info = self.get_race_info(race_id)
-        weather_forecast = self.get_weather_forecast(race_id)
+        weather_forecast = (
+            dict(weather_override)
+            if weather_override is not None
+            else self.get_weather_forecast(race_id)
+        )
         entry_list = self.get_entry_list(race_id)
 
         driver_features: List[Dict[str, Any]] = []
