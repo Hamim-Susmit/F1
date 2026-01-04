@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import logging
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from prometheus_client import Counter, Gauge, Histogram
+from prometheus_client.exposition import generate_latest
+from prometheus_client import CONTENT_TYPE_LATEST
+from pythonjsonlogger import jsonlogger
+from starlette.responses import Response
 
 from f1_prediction_pipeline import (
     F1RacePredictor,
@@ -15,6 +22,28 @@ from f1_prediction_pipeline import (
 
 
 app = FastAPI(title="F1 Prediction API", version="1.0")
+
+logger = logging.getLogger("f1_api")
+log_handler = logging.StreamHandler()
+formatter = jsonlogger.JsonFormatter()
+log_handler.setFormatter(formatter)
+logger.addHandler(log_handler)
+logger.setLevel(logging.INFO)
+
+prediction_requests = Counter(
+    "f1_prediction_requests_total",
+    "Total prediction requests",
+    ["race", "status"],
+)
+prediction_latency = Histogram(
+    "f1_prediction_latency_seconds",
+    "Prediction latency",
+)
+model_accuracy = Gauge(
+    "f1_model_accuracy",
+    "Current model accuracy",
+    ["metric_type"],
+)
 
 
 class PredictionRequest(BaseModel):
@@ -52,6 +81,7 @@ def get_predictor() -> F1RacePredictor:
 
 @app.post("/predict", response_model=RacePrediction)
 async def predict_race(request: PredictionRequest) -> RacePrediction:
+    start_time = time.time()
     try:
         predictor = get_predictor()
         if request.scenario:
@@ -64,6 +94,18 @@ async def predict_race(request: PredictionRequest) -> RacePrediction:
             for item in predictions["predictions"]:
                 item["confidence"] = 0.0
         race = predictions["race"]
+        prediction_requests.labels(race=str(request.race_id), status="success").inc()
+        prediction_latency.observe(time.time() - start_time)
+        logger.info(
+            "Prediction generated",
+            extra={
+                "race_id": request.race_id,
+                "predicted_winner": predictions["predictions"][0]["driver"],
+                "confidence": predictions["predictions"][0]["confidence"],
+                "model_version": predictions["metadata"]["model_versions"].get("xgb_position"),
+                "latency_ms": int((time.time() - start_time) * 1000),
+            },
+        )
         return RacePrediction(
             race_name=race["race_name"],
             circuit=race["circuit_name"],
@@ -72,6 +114,9 @@ async def predict_race(request: PredictionRequest) -> RacePrediction:
             metadata=predictions["metadata"],
         )
     except Exception as exc:
+        prediction_requests.labels(race=str(request.race_id), status="error").inc()
+        prediction_latency.observe(time.time() - start_time)
+        logger.exception("Prediction failed", extra={"race_id": request.race_id})
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
@@ -88,12 +133,21 @@ async def get_upcoming_races() -> Dict[str, Any]:
 @app.get("/model/performance")
 async def get_model_performance() -> Dict[str, Any]:
     evaluator = ModelEvaluator()
-    return evaluator.generate_report(season=2026)
+    report = evaluator.generate_report(season=2026)
+    model_accuracy.labels(metric_type="winner").set(report["winner_accuracy"])
+    model_accuracy.labels(metric_type="top3").set(report["top3_accuracy"])
+    model_accuracy.labels(metric_type="mae").set(report["avg_position_mae"])
+    return report
 
 
 @app.get("/health")
 async def health_check() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/metrics")
+async def metrics() -> Response:
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.post("/scenarios/simulate")
