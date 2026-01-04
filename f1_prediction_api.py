@@ -27,11 +27,10 @@ from f1_prediction_pipeline import (
 app = FastAPI(title="F1 Prediction API", version="1.0")
 
 allowed_origins = [origin.strip() for origin in os.environ.get("ALLOWED_ORIGINS", "*").split(",")]
-allow_credentials = allowed_origins != ["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allowed_origins if allowed_origins != ["*"] else ["*"],
-    allow_credentials=allow_credentials,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
