@@ -14,86 +14,13 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Engine
 from tqdm import tqdm
 
-
-LOG = logging.getLogger("f1_ingest")
-
-
-metadata = sa.MetaData()
-
-races = sa.Table(
-    "races",
-    metadata,
-    sa.Column("race_id", sa.Integer, primary_key=True),
-    sa.Column("season", sa.Integer, nullable=False),
-    sa.Column("round", sa.Integer, nullable=False),
-    sa.Column("race_name", sa.String, nullable=False),
-    sa.Column("circuit_name", sa.String, nullable=False),
-    sa.Column("race_date", sa.Date, nullable=False),
-    sa.Column("winning_time", sa.Float),
-    sa.UniqueConstraint("season", "round", name="uq_races_season_round"),
-)
-
-drivers = sa.Table(
-    "drivers",
-    metadata,
-    sa.Column("driver_id", sa.Integer, primary_key=True),
-    sa.Column("driver_code", sa.String, nullable=False, unique=True),
-    sa.Column("full_name", sa.String, nullable=False),
-    sa.Column("nationality", sa.String),
-)
-
-teams = sa.Table(
-    "teams",
-    metadata,
-    sa.Column("team_id", sa.Integer, primary_key=True),
-    sa.Column("team_name", sa.String, nullable=False, unique=True),
-    sa.Column("engine_manufacturer", sa.String),
-)
-
-race_results = sa.Table(
-    "race_results",
-    metadata,
-    sa.Column("result_id", sa.Integer, primary_key=True),
-    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
-    sa.Column("driver_id", sa.Integer, sa.ForeignKey("drivers.driver_id"), nullable=False),
-    sa.Column("team_id", sa.Integer, sa.ForeignKey("teams.team_id"), nullable=False),
-    sa.Column("grid_position", sa.Integer),
-    sa.Column("finishing_position", sa.Integer),
-    sa.Column("points", sa.Float),
-    sa.Column("status", sa.String),
-    sa.Column("race_time", sa.Float),
-    sa.Column("fastest_lap", sa.Boolean, default=False),
-)
-
-predictions = sa.Table(
-    "predictions",
-    metadata,
-    sa.Column("prediction_id", sa.Integer, primary_key=True),
-    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
-    sa.Column("driver_id", sa.Integer, sa.ForeignKey("drivers.driver_id"), nullable=False),
-    sa.Column("model_version", sa.String, nullable=False),
-    sa.Column("predicted_position", sa.Integer),
-    sa.Column("predicted_time", sa.Float),
-    sa.Column("dnf_probability", sa.Float),
-    sa.Column("podium_probability", sa.Float),
-    sa.Column("confidence", sa.Float),
-    sa.Column("generated_at", sa.DateTime(timezone=True)),
-)
-
-qualifying_results = sa.Table(
-    "qualifying_results",
-    metadata,
-    sa.Column("qual_id", sa.Integer, primary_key=True),
-    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
-    sa.Column("driver_id", sa.Integer, sa.ForeignKey("drivers.driver_id"), nullable=False),
-    sa.Column("q1_time", sa.Float),
-    sa.Column("q2_time", sa.Float),
-    sa.Column("q3_time", sa.Float),
-    sa.Column("grid_position", sa.Integer),
-)
-
-lap_times = sa.Table(
-    "lap_times",
+from f1_schema import (
+    circuit_characteristics,
+    circuit_history,
+    circuits,
+    driver_features,
+    drivers,
+    lap_times,
     metadata,
     pit_stops,
     predictions,
