@@ -88,19 +88,23 @@ class F1RacePredictor:
                 name_clause = ""
                 params: Dict[str, Any] = {"season": season, "round": round_number}
                 if name_hint:
-                    name_clause = "AND race_name ILIKE :name_hint"
-                    params["name_hint"] = f"%{name_hint.replace('_', ' ')}%"
-                query = sa.text(
-                    f"""
+                    name_clause = "AND LOWER(race_name) LIKE :name_hint"
+                    params["name_hint"] = f"%{name_hint.replace('_', ' ').lower()}%"
+                query_base = """
                     SELECT race_id
                     FROM races
                     WHERE season = :season AND round = :round {name_clause}
                     ORDER BY race_id DESC
                     LIMIT 1
                     """
-                )
                 with self.engine.begin() as conn:
-                    row = conn.execute(query, params).scalar_one_or_none()
+                    row = conn.execute(
+                        sa.text(query_base.format(name_clause=name_clause)), params
+                    ).scalar_one_or_none()
+                    if row is None and name_hint:
+                        row = conn.execute(
+                            sa.text(query_base.format(name_clause="")), params
+                        ).scalar_one_or_none()
                 if row is not None:
                     return int(row)
         raise ValueError(f"Unrecognized race identifier: {race_id}")
