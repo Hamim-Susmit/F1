@@ -21,7 +21,7 @@
                    ▼
 ┌─────────────────────────────────────────────────┐
 │       Feature Engineering Pipeline              │
-│  - 150+ features per driver per race            │
+│  - Dozens of engineered features per driver     │
 │  - Real-time updates from practice/quali        │
 │  - Interaction features                         │
 └──────────────────┬──────────────────────────────┘
@@ -53,7 +53,7 @@
 ```
 
 ## Key Features
-- 150+ engineered features per prediction
+- Dozens of engineered features per prediction (driver, team, and situational signals)
 - Ensemble of 4 models for robustness
 - Real-time updates from practice and qualifying
 - Scenario simulation (weather, grid penalties, etc.)

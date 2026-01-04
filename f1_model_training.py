@@ -1,7 +1,7 @@
 import argparse
 import logging
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import joblib
 import numpy as np
@@ -22,9 +22,7 @@ from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.feature_selection import RFE
 from sklearn.inspection import permutation_importance
-from sklearn.metrics import mean_absolute_error, mean_squared_error, roc_auc_score
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 
 
 LOG = logging.getLogger("f1_models")
@@ -154,6 +152,8 @@ def build_fold_indices(
         val_mask = df["season"] == val_year
         fold_indices.append((df.index[train_mask].to_numpy(), df.index[val_mask].to_numpy(), fold["description"]))
     return fold_indices
+
+
 def time_series_cv(
     X: pd.DataFrame, y: pd.Series, n_splits: int
 ) -> List[Tuple[np.ndarray, np.ndarray]]:
@@ -164,8 +164,7 @@ def time_series_cv(
 def tune_xgb_position(
     X: pd.DataFrame,
     y: pd.Series,
-    splits: List[Tuple[np.ndarray, np.ndarray, str]],
-    splits: List[Tuple[np.ndarray, np.ndarray]],
+    splits: Sequence[Tuple[np.ndarray, np.ndarray]],
     trials: int,
 ) -> Dict:
     def objective(trial: optuna.Trial) -> float:
@@ -183,28 +182,11 @@ def tune_xgb_position(
             "random_state": 42,
         }
         scores = []
-        for train_idx, test_idx, _ in splits:
-            model = xgb.XGBRegressor(**params)
-            model.fit(X.iloc[train_idx], y.iloc[train_idx])
-            preds = model.predict(X.iloc[test_idx])
-            scores.append(mean_absolute_error(y.iloc[test_idx], preds))
-            "n_estimators": trial.suggest_int("n_estimators", 200, 600),
-            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1),
-            "max_depth": trial.suggest_int("max_depth", 4, 9),
-            "min_child_weight": trial.suggest_int("min_child_weight", 1, 5),
-            "subsample": trial.suggest_float("subsample", 0.6, 0.9),
-            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 0.9),
-            "gamma": trial.suggest_float("gamma", 0.0, 0.2),
-            "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 0.3),
-            "reg_lambda": trial.suggest_float("reg_lambda", 0.5, 1.5),
-            "random_state": 42,
-        }
-        scores = []
         for train_idx, test_idx in splits:
             model = xgb.XGBRegressor(**params)
             model.fit(X.iloc[train_idx], y.iloc[train_idx])
             preds = model.predict(X.iloc[test_idx])
-            scores.append(mean_squared_error(y.iloc[test_idx], preds))
+            scores.append(mean_absolute_error(y.iloc[test_idx], preds))
         return float(np.mean(scores))
 
     study = optuna.create_study(direction="minimize")
@@ -221,8 +203,7 @@ def train_xgb_position(X: pd.DataFrame, y: pd.Series, params: Dict) -> xgb.XGBRe
 def tune_lgb_time(
     X: pd.DataFrame,
     y: pd.Series,
-    splits: List[Tuple[np.ndarray, np.ndarray, str]],
-    splits: List[Tuple[np.ndarray, np.ndarray]],
+    splits: Sequence[Tuple[np.ndarray, np.ndarray]],
     trials: int,
 ) -> Dict:
     def objective(trial: optuna.Trial) -> float:
@@ -238,7 +219,6 @@ def tune_lgb_time(
             "n_estimators": trial.suggest_int("n_estimators", 150, 400),
         }
         scores = []
-        for train_idx, test_idx, _ in splits:
         for train_idx, test_idx in splits:
             model = lgb.LGBMRegressor(**params)
             model.fit(X.iloc[train_idx], y.iloc[train_idx])
@@ -271,7 +251,6 @@ def train_lgb_position_quantile(
     lgb_params = dict(params)
     lgb_params.update({"objective": "quantile", "alpha": alpha})
     model = lgb.LGBMRegressor(**lgb_params)
-    model = lgb.LGBMRegressor(**params)
     model.fit(X, y)
     return model
 
@@ -292,7 +271,6 @@ def resample_for_dnf(X: pd.DataFrame, y: pd.Series) -> Tuple[pd.DataFrame, pd.Se
 
 def train_xgb_dnf(X: pd.DataFrame, y: pd.Series) -> xgb.XGBClassifier:
     class_ratio = (y == 0).sum() / max((y == 1).sum(), 1)
-def train_xgb_dnf(X: pd.DataFrame, y: pd.Series) -> xgb.XGBClassifier:
     params = {
         "objective": "binary:logistic",
         "n_estimators": 200,
@@ -303,10 +281,6 @@ def train_xgb_dnf(X: pd.DataFrame, y: pd.Series) -> xgb.XGBClassifier:
     X_resampled, y_resampled = resample_for_dnf(X, y)
     model = xgb.XGBClassifier(**params)
     model.fit(X_resampled, y_resampled)
-        "scale_pos_weight": 10,
-    }
-    model = xgb.XGBClassifier(**params)
-    model.fit(X, y)
     return model
 
 
@@ -323,8 +297,6 @@ def train_xgb_podium(X: pd.DataFrame, y: pd.Series) -> xgb.XGBClassifier:
     sample_weight = y.map(class_weight).to_numpy()
     model = xgb.XGBClassifier(**params)
     model.fit(X, y, sample_weight=sample_weight)
-    model = xgb.XGBClassifier(**params)
-    model.fit(X, y)
     return model
 
 
@@ -488,9 +460,10 @@ def evaluate_models(
 
     folds = create_cv_folds(df["season"])
     fold_indices = build_fold_indices(df, folds)
+    fold_splits = [(train_idx, val_idx) for train_idx, val_idx, _ in fold_indices]
 
-    xgb_params = tune_xgb_position(X, y_position, fold_indices, optuna_trials)
-    lgb_params = tune_lgb_time(X, y_time, fold_indices, optuna_trials)
+    xgb_params = tune_xgb_position(X, y_position, fold_splits, optuna_trials)
+    lgb_params = tune_lgb_time(X, y_time, fold_splits, optuna_trials)
 
     evaluate_time_series_folds(
         df,

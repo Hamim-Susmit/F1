@@ -65,6 +65,21 @@ race_results = sa.Table(
     sa.Column("fastest_lap", sa.Boolean, default=False),
 )
 
+predictions = sa.Table(
+    "predictions",
+    metadata,
+    sa.Column("prediction_id", sa.Integer, primary_key=True),
+    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
+    sa.Column("driver_id", sa.Integer, sa.ForeignKey("drivers.driver_id"), nullable=False),
+    sa.Column("model_version", sa.String, nullable=False),
+    sa.Column("predicted_position", sa.Integer),
+    sa.Column("predicted_time", sa.Float),
+    sa.Column("dnf_probability", sa.Float),
+    sa.Column("podium_probability", sa.Float),
+    sa.Column("confidence", sa.Float),
+    sa.Column("generated_at", sa.DateTime(timezone=True)),
+)
+
 qualifying_results = sa.Table(
     "qualifying_results",
     metadata,
@@ -1895,7 +1910,7 @@ def extract_race_features(conn: sa.Connection, race_id: int, driver_id: int) -> 
             qualifying_results.c.race_id,
             qualifying_results.c.driver_id,
             qualifying_results.c.grid_position.label("qualifying_position"),
-        ),
+        ).where(qualifying_results.c.race_id == race_id),
         conn,
     )
     laps_df = pd.read_sql(
@@ -1905,7 +1920,16 @@ def extract_race_features(conn: sa.Connection, race_id: int, driver_id: int) -> 
             lap_times.c.lap_number,
             lap_times.c.lap_time,
             lap_times.c.tire_compound,
-        ),
+        ).where(lap_times.c.race_id == race_id),
+        conn,
+    )
+    pit_df = pd.read_sql(
+        sa.select(
+            pit_stops.c.race_id,
+            pit_stops.c.driver_id,
+            pit_stops.c.stop_number,
+            pit_stops.c.duration,
+        ).where(pit_stops.c.race_id == race_id),
         conn,
     )
     weather_df = pd.read_sql(
@@ -1914,9 +1938,13 @@ def extract_race_features(conn: sa.Connection, race_id: int, driver_id: int) -> 
             race_weather.c.conditions,
             race_weather.c.wet_race_probability,
             race_weather.c.weather_change_probability,
-        ),
+        ).where(race_weather.c.race_id == race_id),
         conn,
     )
+    circuits_df = pd.read_sql(
+        sa.select(circuits.c.circuit_name, circuits.c.circuit_type),
+        conn,
+    ).set_index("circuit_name")
     circuit_char_df = pd.read_sql(
         sa.select(
             circuits.c.circuit_id,
@@ -1951,7 +1979,7 @@ def extract_race_features(conn: sa.Connection, race_id: int, driver_id: int) -> 
             team_features.c.strategy_success_rate,
             team_features.c.historical_avg_points_at_circuit,
             team_features.c.dnf_rate_last_10_races,
-        ),
+        ).where(team_features.c.race_id == race_id),
         conn,
     )
     driver_features_df = pd.read_sql(
@@ -1966,7 +1994,7 @@ def extract_race_features(conn: sa.Connection, race_id: int, driver_id: int) -> 
             driver_features.c.tire_management_score,
             driver_features.c.qualifying_pace_percentile,
             driver_features.c.race_pace_percentile,
-        ),
+        ).where(driver_features.c.race_id == race_id),
         conn,
     )
 

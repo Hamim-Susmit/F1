@@ -1,7 +1,8 @@
+import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-from typing import Any, Dict, Optional, Tuple
 
 import joblib
 import numpy as np
@@ -45,9 +46,17 @@ def confidence_interval(prediction: float, uncertainty: float) -> Tuple[float, f
 
 
 class RegulationImpactModel:
-    def __init__(self, model: Optional[Any] = None) -> None:
+    def __init__(self, model: Optional[Any] = None, factors_path: Optional[str] = None) -> None:
         self.model = model
-        self.factors = {
+        if factors_path is None:
+            factors_path = os.environ.get("REGULATION_FACTORS_PATH")
+        self.factors = self.load_factors(factors_path)
+
+    def load_factors(self, factors_path: Optional[str]) -> Dict[str, Dict[str, float]]:
+        if factors_path and os.path.exists(factors_path):
+            with open(factors_path, "r", encoding="utf-8") as handle:
+                return json.load(handle)
+        return {
             "engineering_strength": self.load_team_engineering_scores(),
             "budget_efficiency": self.load_budget_cap_data(),
             "aero_expertise": self.load_aero_expertise(),
