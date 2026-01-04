@@ -50,3 +50,17 @@ def test_driver_and_team_endpoints(tmp_path, monkeypatch) -> None:
     assert teams_resp.status_code == 200
     assert len(drivers_resp.json()["drivers"]) == 2
     assert len(teams_resp.json()["teams"]) == 2
+
+
+def test_driver_endpoints_require_api_key(tmp_path, monkeypatch) -> None:
+    database_url = setup_test_db(tmp_path)
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.setenv("API_KEY", "test-key")
+
+    client = TestClient(app)
+
+    missing_key_resp = client.get("/drivers")
+    invalid_key_resp = client.get("/drivers", headers={"X-API-Key": "wrong-key"})
+
+    assert missing_key_resp.status_code == 401
+    assert invalid_key_resp.status_code == 401
