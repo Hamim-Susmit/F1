@@ -39,7 +39,6 @@
 ┌─────────────────────────────────────────────────┐
 │          Prediction API (FastAPI)               │
 │  - REST endpoints                               │
-│  - WebSocket for live updates                   │
 │  - Caching layer (Redis)                        │
 └──────────────────┬──────────────────────────────┘
                    │
