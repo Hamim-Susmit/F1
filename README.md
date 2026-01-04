@@ -61,7 +61,7 @@ Environment variables (see `.env.example`):
 - `OPENWEATHER_API_KEY` - weather API key
 - `WEATHER_BASE_URL` - weather API base URL
 - `API_KEY` - API authentication key
-- `ALLOWED_ORIGINS` - CORS configuration (must be explicit when `API_KEY` is set)
+- `ALLOWED_ORIGINS` - CORS configuration
 - `REDIS_URL` - Redis connection string
 
 ## Troubleshooting

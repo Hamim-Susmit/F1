@@ -1,11 +1,9 @@
 import os
 
-import pytest
+import sqlalchemy as sa
+from fastapi.testclient import TestClient
 
-sa = pytest.importorskip("sqlalchemy")
-from fastapi.testclient import TestClient  # noqa: E402
-
-from f1_schema import drivers, metadata, teams  # noqa: E402
+from f1_data_ingest import drivers, metadata, teams
 from f1_prediction_api import app
 
 

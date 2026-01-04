@@ -14,13 +14,86 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Engine
 from tqdm import tqdm
 
-from f1_schema import (
-    circuit_characteristics,
-    circuit_history,
-    circuits,
-    driver_features,
-    drivers,
-    lap_times,
+
+LOG = logging.getLogger("f1_ingest")
+
+
+metadata = sa.MetaData()
+
+races = sa.Table(
+    "races",
+    metadata,
+    sa.Column("race_id", sa.Integer, primary_key=True),
+    sa.Column("season", sa.Integer, nullable=False),
+    sa.Column("round", sa.Integer, nullable=False),
+    sa.Column("race_name", sa.String, nullable=False),
+    sa.Column("circuit_name", sa.String, nullable=False),
+    sa.Column("race_date", sa.Date, nullable=False),
+    sa.Column("winning_time", sa.Float),
+    sa.UniqueConstraint("season", "round", name="uq_races_season_round"),
+)
+
+drivers = sa.Table(
+    "drivers",
+    metadata,
+    sa.Column("driver_id", sa.Integer, primary_key=True),
+    sa.Column("driver_code", sa.String, nullable=False, unique=True),
+    sa.Column("full_name", sa.String, nullable=False),
+    sa.Column("nationality", sa.String),
+)
+
+teams = sa.Table(
+    "teams",
+    metadata,
+    sa.Column("team_id", sa.Integer, primary_key=True),
+    sa.Column("team_name", sa.String, nullable=False, unique=True),
+    sa.Column("engine_manufacturer", sa.String),
+)
+
+race_results = sa.Table(
+    "race_results",
+    metadata,
+    sa.Column("result_id", sa.Integer, primary_key=True),
+    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
+    sa.Column("driver_id", sa.Integer, sa.ForeignKey("drivers.driver_id"), nullable=False),
+    sa.Column("team_id", sa.Integer, sa.ForeignKey("teams.team_id"), nullable=False),
+    sa.Column("grid_position", sa.Integer),
+    sa.Column("finishing_position", sa.Integer),
+    sa.Column("points", sa.Float),
+    sa.Column("status", sa.String),
+    sa.Column("race_time", sa.Float),
+    sa.Column("fastest_lap", sa.Boolean, default=False),
+)
+
+predictions = sa.Table(
+    "predictions",
+    metadata,
+    sa.Column("prediction_id", sa.Integer, primary_key=True),
+    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
+    sa.Column("driver_id", sa.Integer, sa.ForeignKey("drivers.driver_id"), nullable=False),
+    sa.Column("model_version", sa.String, nullable=False),
+    sa.Column("predicted_position", sa.Integer),
+    sa.Column("predicted_time", sa.Float),
+    sa.Column("dnf_probability", sa.Float),
+    sa.Column("podium_probability", sa.Float),
+    sa.Column("confidence", sa.Float),
+    sa.Column("generated_at", sa.DateTime(timezone=True)),
+)
+
+qualifying_results = sa.Table(
+    "qualifying_results",
+    metadata,
+    sa.Column("qual_id", sa.Integer, primary_key=True),
+    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
+    sa.Column("driver_id", sa.Integer, sa.ForeignKey("drivers.driver_id"), nullable=False),
+    sa.Column("q1_time", sa.Float),
+    sa.Column("q2_time", sa.Float),
+    sa.Column("q3_time", sa.Float),
+    sa.Column("grid_position", sa.Integer),
+)
+
+lap_times = sa.Table(
+    "lap_times",
     metadata,
     pit_stops,
     predictions,
@@ -1586,12 +1659,7 @@ def update_team_features(engine: Engine, lookback_period: int = 10) -> None:
                 conn.execute(stmt)
 
 
-def extract_race_features(
-    conn: sa.Connection,
-    race_id: int,
-    driver_id: int,
-    lookback_races: int = 50,
-) -> Dict[str, Any]:
+def extract_race_features(conn: sa.Connection, race_id: int, driver_id: int) -> Dict[str, Any]:
     race_row = conn.execute(
         sa.select(races.c.race_id, races.c.season, races.c.round, races.c.circuit_name).where(
             races.c.race_id == race_id
@@ -1609,10 +1677,10 @@ def extract_race_features(
     races_df = pd.read_sql(
         sa.select(races.c.race_id, races.c.season, races.c.round, races.c.circuit_name)
         .where(race_scope)
-        .order_by(races.c.season.desc(), races.c.round.desc())
-        .limit(lookback_races),
+        .order_by(races.c.season, races.c.round),
         conn,
-    ).sort_values(["season", "round"]).reset_index(drop=True)
+    )
+    races_df = races_df.reset_index(drop=True)
     races_df["order_index"] = range(len(races_df))
     race_ids = races_df["race_id"].tolist()
     if not race_ids:
@@ -1631,7 +1699,7 @@ def extract_race_features(
             races.c.circuit_name,
         )
         .select_from(race_results.join(races, race_results.c.race_id == races.c.race_id))
-        .where(race_results.c.race_id.in_(race_ids)),
+        .where(race_scope),
         conn,
     )
     qualifying_df = pd.read_sql(

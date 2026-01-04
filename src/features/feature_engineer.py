@@ -13,13 +13,6 @@ class FeatureEngineer:
     def __init__(self, engine: sa.Engine) -> None:
         self.engine = engine
 
-    def build_features(
-        self, race_id: int, driver_id: int, lookback_races: int = 50
-    ) -> Dict[str, Any]:
+    def build_features(self, race_id: int, driver_id: int) -> Dict[str, Any]:
         with self.engine.begin() as conn:
-            return extract_race_features(
-                conn,
-                race_id=race_id,
-                driver_id=driver_id,
-                lookback_races=lookback_races,
-            )
+            return extract_race_features(conn, race_id=race_id, driver_id=driver_id)

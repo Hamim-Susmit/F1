@@ -1,4 +1,4 @@
-from f1_schema import (  # noqa: F401
+from f1_data_ingest import (  # noqa: F401
     circuit_characteristics,
     circuit_history,
     circuits,

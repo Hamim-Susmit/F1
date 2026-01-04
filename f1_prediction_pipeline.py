@@ -57,13 +57,13 @@ class F1RacePredictor:
         self.model_dir = model_dir
         self.missing_models: List[str] = []
         self.models = {
-            "xgb_position": self._load_required_joblib("xgb_position.joblib"),
+            "xgb_position": self._load_joblib("xgb_position.joblib"),
             "lgb_position": self._load_optional_joblib("lgb_position.joblib"),
-            "lgb_time": self._load_required_joblib("lgb_time.joblib"),
-            "rf_position": self._load_required_joblib("rf_position.joblib"),
-            "nn_position": self._load_required_keras("nn_position.keras"),
-            "xgb_dnf": self._load_required_joblib("xgb_dnf.joblib"),
-            "xgb_podium": self._load_required_joblib("xgb_podium.joblib"),
+            "lgb_time": self._load_joblib("lgb_time.joblib"),
+            "rf_position": self._load_joblib("rf_position.joblib"),
+            "nn_position": self._load_keras("nn_position.keras"),
+            "xgb_dnf": self._load_joblib("xgb_dnf.joblib"),
+            "xgb_podium": self._load_joblib("xgb_podium.joblib"),
         }
         if self.missing_models:
             missing = ", ".join(sorted(self.missing_models))
@@ -74,11 +74,10 @@ class F1RacePredictor:
         self.team_performance_overrides: Dict[str, float] = {}
         self.dnf_overrides: set[int] = set()
 
-    def _load_required_joblib(self, filename: str):
+    def _load_joblib(self, filename: str):
         path = os.path.join(self.model_dir, filename)
         if not os.path.exists(path):
-            self.missing_models.append(filename)
-            return None
+            raise FileNotFoundError(f"Model file not found: {path}")
         return joblib.load(path)
 
     def _load_optional_joblib(self, filename: str):
@@ -87,11 +86,10 @@ class F1RacePredictor:
             return None
         return joblib.load(path)
 
-    def _load_required_keras(self, filename: str):
+    def _load_keras(self, filename: str):
         path = os.path.join(self.model_dir, filename)
         if not os.path.exists(path):
-            self.missing_models.append(filename)
-            return None
+            raise FileNotFoundError(f"Model file not found: {path}")
         return keras.models.load_model(path)
 
     def set_weather_scenario(self, scenario: str | None) -> None:
@@ -148,6 +146,9 @@ class F1RacePredictor:
 
     def get_race_info(self, race_id: int | str) -> Dict[str, Any]:
         race_id = self.normalize_race_id(race_id)
+        if self.missing_models:
+            missing = ", ".join(sorted(self.missing_models))
+            raise RuntimeError(f"Missing required model artifacts: {missing}")
         query = sa.text(
             """
             SELECT race_id, season, round, race_name, circuit_name, race_date

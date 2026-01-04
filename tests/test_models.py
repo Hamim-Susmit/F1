@@ -1,6 +1,4 @@
-import pytest
-
-np = pytest.importorskip("numpy")
+import numpy as np
 
 from f1_prediction_2026 import estimate_uncertainty
 
