@@ -22,7 +22,7 @@
 ┌─────────────────────────────────────────────────┐
 │       Feature Engineering Pipeline              │
 │  - Dozens of engineered features per driver     │
-│  - Real-time updates from practice/quali        │
+│  - Real-time updates from practice/qualifying   │
 │  - Interaction features                         │
 └──────────────────┬──────────────────────────────┘
                    │
