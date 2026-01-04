@@ -46,11 +46,96 @@ def confidence_interval(prediction: float, uncertainty: float) -> Tuple[float, f
 class RegulationImpactModel:
     def __init__(self, model: Optional[Any] = None) -> None:
         self.model = model
+        self.factors = {
+            "engineering_strength": self.load_team_engineering_scores(),
+            "budget_efficiency": self.load_budget_cap_data(),
+            "aero_expertise": self.load_aero_expertise(),
+            "pu_manufacturer_advantage": self.load_pu_data(),
+        }
+
+    def load_team_engineering_scores(self) -> Dict[str, float]:
+        return {
+            "Mercedes": 0.9,
+            "Red Bull": 0.92,
+            "McLaren": 0.86,
+            "Ferrari": 0.85,
+            "Aston Martin": 0.82,
+        }
+
+    def load_budget_cap_data(self) -> Dict[str, float]:
+        return {
+            "Mercedes": 0.8,
+            "Red Bull": 0.78,
+            "McLaren": 0.75,
+            "Ferrari": 0.77,
+            "Aston Martin": 0.7,
+        }
+
+    def load_aero_expertise(self) -> Dict[str, float]:
+        return {
+            "Mercedes": 0.82,
+            "Red Bull": 0.95,
+            "McLaren": 0.9,
+            "Ferrari": 0.88,
+            "Aston Martin": 0.85,
+        }
+
+    def load_pu_data(self) -> Dict[str, float]:
+        return {
+            "Mercedes": 0.85,
+            "Red Bull": 0.8,
+            "McLaren": 0.82,
+            "Ferrari": 0.9,
+            "Aston Martin": 0.88,
+            "Audi": 0.9,
+            "Honda": 0.88,
+        }
 
     def predict(self, features: np.ndarray) -> np.ndarray:
         if self.model is None:
             return np.ones(features.shape[0])
         return self.model.predict(features)
+
+    def predict_2026_performance(self, team: str, season_2025_performance: float) -> float:
+        aero_advantage = self.factors["aero_expertise"].get(team, 0.5) * 0.3
+        engineering_advantage = self.factors["engineering_strength"].get(team, 0.5) * 0.25
+        budget_advantage = self.factors["budget_efficiency"].get(team, 0.5) * 0.15
+        pu_advantage = self.factors["pu_manufacturer_advantage"].get(team, 0.5) * 0.20
+        newey_factor = 1.5 if team == "Aston Martin" else 1.0
+        random_factor = float(np.random.normal(1.0, 0.15))
+        adaptation_score = (
+            aero_advantage + engineering_advantage + budget_advantage + pu_advantage
+        ) * newey_factor * random_factor
+        predicted_2026 = season_2025_performance * 0.3 + adaptation_score * 0.7
+        return float(predicted_2026)
+
+    def identify_dark_horses(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "team": "Aston Martin",
+                "reason": "Adrian Newey + Honda works partnership",
+                "upside_potential": 0.85,
+            },
+            {
+                "team": "Audi",
+                "reason": "Works power unit manufacturer",
+                "upside_potential": 0.6,
+            },
+            {
+                "team": "Williams",
+                "reason": "James Vowles leadership + reset",
+                "upside_potential": 0.45,
+            },
+        ]
+
+    def calculate_uncertainty(self, race_number: int) -> float:
+        if race_number <= 3:
+            return 0.40
+        if race_number <= 7:
+            return 0.25
+        if race_number <= 15:
+            return 0.15
+        return 0.10
 
 
 class F1Prediction2026:
