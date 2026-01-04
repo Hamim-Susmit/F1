@@ -51,3 +51,21 @@
 │  - Model performance tracking                   │
 └─────────────────────────────────────────────────┘
 ```
+
+## Key Features
+- 150+ engineered features per prediction
+- Ensemble of 4 models for robustness
+- Real-time updates from practice and qualifying
+- Scenario simulation (weather, grid penalties, etc.)
+- Explainable AI (SHAP values explain each prediction)
+- Continuous learning (retrain after each race)
+- 2026-specific adaptations for new regulations
+
+## Performance Targets
+| Metric | Target | Current |
+| --- | --- | --- |
+| Winner Accuracy | 45% | TBD |
+| Top 3 Accuracy | 65% | TBD |
+| Top 10 Accuracy | 80% | TBD |
+| Position MAE | <2.5 | TBD |
+| API Latency p95 | <500ms | TBD |
