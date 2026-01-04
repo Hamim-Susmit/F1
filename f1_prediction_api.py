@@ -91,6 +91,11 @@ async def get_model_performance() -> Dict[str, Any]:
     return evaluator.generate_report(season=2026)
 
 
+@app.get("/health")
+async def health_check() -> Dict[str, str]:
+    return {"status": "ok"}
+
+
 @app.post("/scenarios/simulate")
 async def simulate_scenarios(race_id: int, scenarios: List[str]) -> Dict[str, Any]:
     predictor = get_predictor()
