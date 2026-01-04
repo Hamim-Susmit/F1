@@ -14,313 +14,28 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Engine
 from tqdm import tqdm
 
+from f1_schema import (
+    circuit_characteristics,
+    circuit_history,
+    circuits,
+    driver_features,
+    drivers,
+    lap_times,
+    metadata,
+    pit_stops,
+    predictions,
+    qualifying_results,
+    race_results,
+    race_weather,
+    race_weather_forecasts,
+    races,
+    situational_features,
+    team_features,
+    teams,
+)
+
 
 LOG = logging.getLogger("f1_ingest")
-
-
-metadata = sa.MetaData()
-
-races = sa.Table(
-    "races",
-    metadata,
-    sa.Column("race_id", sa.Integer, primary_key=True),
-    sa.Column("season", sa.Integer, nullable=False),
-    sa.Column("round", sa.Integer, nullable=False),
-    sa.Column("race_name", sa.String, nullable=False),
-    sa.Column("circuit_name", sa.String, nullable=False),
-    sa.Column("race_date", sa.Date, nullable=False),
-    sa.Column("winning_time", sa.Float),
-    sa.UniqueConstraint("season", "round", name="uq_races_season_round"),
-)
-
-drivers = sa.Table(
-    "drivers",
-    metadata,
-    sa.Column("driver_id", sa.Integer, primary_key=True),
-    sa.Column("driver_code", sa.String, nullable=False, unique=True),
-    sa.Column("full_name", sa.String, nullable=False),
-    sa.Column("nationality", sa.String),
-)
-
-teams = sa.Table(
-    "teams",
-    metadata,
-    sa.Column("team_id", sa.Integer, primary_key=True),
-    sa.Column("team_name", sa.String, nullable=False, unique=True),
-    sa.Column("engine_manufacturer", sa.String),
-)
-
-race_results = sa.Table(
-    "race_results",
-    metadata,
-    sa.Column("result_id", sa.Integer, primary_key=True),
-    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
-    sa.Column("driver_id", sa.Integer, sa.ForeignKey("drivers.driver_id"), nullable=False),
-    sa.Column("team_id", sa.Integer, sa.ForeignKey("teams.team_id"), nullable=False),
-    sa.Column("grid_position", sa.Integer),
-    sa.Column("finishing_position", sa.Integer),
-    sa.Column("points", sa.Float),
-    sa.Column("status", sa.String),
-    sa.Column("race_time", sa.Float),
-    sa.Column("fastest_lap", sa.Boolean, default=False),
-)
-
-qualifying_results = sa.Table(
-    "qualifying_results",
-    metadata,
-    sa.Column("qual_id", sa.Integer, primary_key=True),
-    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
-    sa.Column("driver_id", sa.Integer, sa.ForeignKey("drivers.driver_id"), nullable=False),
-    sa.Column("q1_time", sa.Float),
-    sa.Column("q2_time", sa.Float),
-    sa.Column("q3_time", sa.Float),
-    sa.Column("grid_position", sa.Integer),
-)
-
-lap_times = sa.Table(
-    "lap_times",
-    metadata,
-    sa.Column("lap_id", sa.Integer, primary_key=True),
-    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
-    sa.Column("driver_id", sa.Integer, sa.ForeignKey("drivers.driver_id"), nullable=False),
-    sa.Column("lap_number", sa.Integer, nullable=False),
-    sa.Column("lap_time", sa.Float),
-    sa.Column("tire_compound", sa.String),
-)
-
-pit_stops = sa.Table(
-    "pit_stops",
-    metadata,
-    sa.Column("stop_id", sa.Integer, primary_key=True),
-    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
-    sa.Column("driver_id", sa.Integer, sa.ForeignKey("drivers.driver_id"), nullable=False),
-    sa.Column("stop_number", sa.Integer, nullable=False),
-    sa.Column("lap", sa.Integer, nullable=False),
-    sa.Column("duration", sa.Float),
-    sa.Column("tire_in", sa.String),
-    sa.Column("tire_out", sa.String),
-)
-
-race_weather = sa.Table(
-    "race_weather",
-    metadata,
-    sa.Column("weather_id", sa.Integer, primary_key=True),
-    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
-    sa.Column("session_type", sa.String, nullable=False),
-    sa.Column("air_temp", sa.Float),
-    sa.Column("track_temp", sa.Float),
-    sa.Column("rain_probability", sa.Float),
-    sa.Column("rain_amount", sa.Float),
-    sa.Column("humidity", sa.Float),
-    sa.Column("wind_speed", sa.Float),
-    sa.Column("wind_direction", sa.Float),
-    sa.Column("conditions", sa.String),
-    sa.Column("wet_race_probability", sa.Float),
-    sa.Column("temp_deviation", sa.Float),
-    sa.Column("weather_change_probability", sa.Float),
-    sa.Column("is_estimated", sa.Boolean, default=False),
-    sa.Column("source", sa.String),
-    sa.Column("observed_at", sa.DateTime(timezone=True)),
-)
-
-race_weather_forecasts = sa.Table(
-    "race_weather_forecasts",
-    metadata,
-    sa.Column("forecast_id", sa.Integer, primary_key=True),
-    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
-    sa.Column("session_type", sa.String, nullable=False),
-    sa.Column("forecast_time", sa.DateTime(timezone=True), nullable=False),
-    sa.Column("air_temp", sa.Float),
-    sa.Column("track_temp", sa.Float),
-    sa.Column("rain_probability", sa.Float),
-    sa.Column("rain_amount", sa.Float),
-    sa.Column("humidity", sa.Float),
-    sa.Column("wind_speed", sa.Float),
-    sa.Column("wind_direction", sa.Float),
-    sa.Column("conditions", sa.String),
-    sa.Column("source", sa.String),
-)
-
-circuits = sa.Table(
-    "circuits",
-    metadata,
-    sa.Column("circuit_id", sa.Integer, primary_key=True),
-    sa.Column("circuit_name", sa.String, nullable=False, unique=True),
-    sa.Column("country", sa.String),
-    sa.Column("circuit_length", sa.Float),
-    sa.Column("number_of_corners", sa.Integer),
-    sa.Column("longest_straight", sa.Float),
-    sa.Column("circuit_type", sa.String),
-    sa.Column("altitude", sa.Integer),
-    sa.Column("lap_record", sa.Float),
-    sa.Column("lap_record_holder", sa.String),
-    sa.Column("lap_record_year", sa.Integer),
-)
-
-circuit_characteristics = sa.Table(
-    "circuit_characteristics",
-    metadata,
-    sa.Column("char_id", sa.Integer, primary_key=True),
-    sa.Column("circuit_id", sa.Integer, sa.ForeignKey("circuits.circuit_id"), nullable=False),
-    sa.Column("high_speed_corners", sa.Integer),
-    sa.Column("medium_speed_corners", sa.Integer),
-    sa.Column("low_speed_corners", sa.Integer),
-    sa.Column("overtaking_difficulty", sa.Integer),
-    sa.Column("drs_zones", sa.Integer),
-    sa.Column("pit_lane_time_loss", sa.Float),
-    sa.Column("track_evolution_factor", sa.Float),
-    sa.Column("safety_car_probability", sa.Float),
-    sa.Column("average_pit_stops", sa.Float),
-    sa.Column("typical_strategy", sa.String),
-    sa.Column("overtaking_frequency", sa.Float),
-    sa.Column("grid_finish_correlation", sa.Float),
-    sa.Column("qualifying_importance", sa.Float),
-    sa.Column("tire_degradation_severity", sa.Float),
-    sa.Column("strategy_variation", sa.Float),
-    sa.UniqueConstraint("circuit_id", name="circuit_characteristics_circuit_id_key"),
-)
-
-circuit_history = sa.Table(
-    "circuit_history",
-    metadata,
-    sa.Column("history_id", sa.Integer, primary_key=True),
-    sa.Column("circuit_id", sa.Integer, sa.ForeignKey("circuits.circuit_id"), nullable=False),
-    sa.Column("season", sa.Integer, nullable=False),
-    sa.Column("pole_win_rate", sa.Float),
-    sa.Column("average_winning_margin", sa.Float),
-    sa.Column("safety_car_frequency", sa.Float),
-    sa.Column("red_flag_count", sa.Integer),
-    sa.Column("weather_variability", sa.Float),
-    sa.UniqueConstraint("circuit_id", "season", name="uq_circuit_history"),
-)
-
-driver_features = sa.Table(
-    "driver_features",
-    metadata,
-    sa.Column("feature_id", sa.Integer, primary_key=True),
-    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
-    sa.Column("driver_id", sa.Integer, sa.ForeignKey("drivers.driver_id"), nullable=False),
-    sa.Column("last_3_races_avg_position", sa.Float),
-    sa.Column("last_5_races_avg_position", sa.Float),
-    sa.Column("last_3_races_points_scored", sa.Float),
-    sa.Column("recent_dnf_rate", sa.Float),
-    sa.Column("recent_qualifying_avg_position", sa.Float),
-    sa.Column("positions_gained_last_3_races", sa.Float),
-    sa.Column("avg_finish_position_at_circuit", sa.Float),
-    sa.Column("best_result_at_circuit", sa.Float),
-    sa.Column("worst_result_at_circuit", sa.Float),
-    sa.Column("qualifying_to_race_conversion_at_circuit", sa.Float),
-    sa.Column("avg_positions_gained_lap1_at_circuit", sa.Float),
-    sa.Column("crash_rate_at_circuit", sa.Float),
-    sa.Column("qualifying_pace_percentile", sa.Float),
-    sa.Column("race_pace_percentile", sa.Float),
-    sa.Column("overtaking_success_rate", sa.Float),
-    sa.Column("defending_success_rate", sa.Float),
-    sa.Column("wet_weather_performance_multiplier", sa.Float),
-    sa.Column("first_lap_position_change_avg", sa.Float),
-    sa.Column("consistency_score", sa.Float),
-    sa.Column("tire_management_score", sa.Float),
-    sa.Column("total_f1_races", sa.Integer),
-    sa.Column("races_at_this_circuit", sa.Integer),
-    sa.Column("years_with_current_team", sa.Integer),
-    sa.Column("championship_experience", sa.Integer),
-    sa.Column("podium_count", sa.Integer),
-    sa.Column("win_count", sa.Integer),
-    sa.Column("qualifying_gap_to_teammate", sa.Float),
-    sa.Column("race_gap_to_teammate", sa.Float),
-    sa.Column("head_to_head_qualifying", sa.Float),
-    sa.Column("head_to_head_race", sa.Float),
-    sa.Column("championship_position", sa.Integer),
-    sa.Column("points_from_leader", sa.Float),
-    sa.Column("contract_year_flag", sa.Boolean),
-    sa.Column("recent_incidents_count", sa.Integer),
-    sa.Column("consecutive_race_finishes", sa.Integer),
-    sa.UniqueConstraint("race_id", "driver_id", name="uq_driver_features"),
-)
-
-team_features = sa.Table(
-    "team_features",
-    metadata,
-    sa.Column("feature_id", sa.Integer, primary_key=True),
-    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
-    sa.Column("team_id", sa.Integer, sa.ForeignKey("teams.team_id"), nullable=False),
-    sa.Column("performance_trend_last_5_races", sa.Float),
-    sa.Column("points_per_race_last_3_vs_previous_3", sa.Float),
-    sa.Column("constructor_position_change", sa.Float),
-    sa.Column("upgrades_impact_score", sa.Float),
-    sa.Column("dnf_rate_last_10_races", sa.Float),
-    sa.Column("mechanical_dnf_rate", sa.Float),
-    sa.Column("races_both_cars_finished", sa.Float),
-    sa.Column("engine_penalty_frequency", sa.Float),
-    sa.Column("straight_line_speed_ranking", sa.Float),
-    sa.Column("high_speed_corner_ranking", sa.Float),
-    sa.Column("low_speed_corner_ranking", sa.Float),
-    sa.Column("overall_downforce_level", sa.String),
-    sa.Column("tire_wear_rate", sa.String),
-    sa.Column("qualifying_vs_race_pace_balance", sa.Float),
-    sa.Column("team_performance_at_circuit_type", sa.Float),
-    sa.Column("historical_avg_points_at_circuit", sa.Float),
-    sa.Column("best_finish_at_circuit", sa.Float),
-    sa.Column("car_characteristics_circuit_match_score", sa.Float),
-    sa.Column("avg_pit_stop_duration", sa.Float),
-    sa.Column("pit_stop_consistency", sa.Float),
-    sa.Column("strategy_success_rate", sa.Float),
-    sa.Column("team_orders_likelihood", sa.Float),
-    sa.Column("momentum_score", sa.Float),
-    sa.UniqueConstraint("race_id", "team_id", name="uq_team_features"),
-)
-
-situational_features = sa.Table(
-    "situational_features",
-    metadata,
-    sa.Column("feature_id", sa.Integer, primary_key=True),
-    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
-    sa.Column("driver_id", sa.Integer, sa.ForeignKey("drivers.driver_id"), nullable=False),
-    sa.Column("grid_position", sa.Integer),
-    sa.Column("starting_tire_compound", sa.String),
-    sa.Column("grid_side", sa.String),
-    sa.Column("positions_historically_gained_from_this_grid", sa.Float),
-    sa.Column("expected_lap1_position", sa.Float),
-    sa.Column("optimal_tire_strategy", sa.String),
-    sa.Column("tire_compound_advantage", sa.Float),
-    sa.Column("pit_window_overlap_count", sa.Integer),
-    sa.Column("undercut_opportunity_score", sa.Float),
-    sa.Column("overcut_opportunity_score", sa.Float),
-    sa.Column("strategic_position_value", sa.Float),
-    sa.Column("championship_position", sa.Integer),
-    sa.Column("points_gap_to_next", sa.Float),
-    sa.Column("points_gap_to_previous", sa.Float),
-    sa.Column("mathematical_championship_possible", sa.Boolean),
-    sa.Column("must_win_race_flag", sa.Boolean),
-    sa.Column("team_orders_risk_score", sa.Float),
-    sa.Column("first_lap_incident_probability", sa.Float),
-    sa.Column("safety_car_probability", sa.Float),
-    sa.Column("red_flag_probability", sa.Float),
-    sa.Column("expected_dnf_rate", sa.Float),
-    sa.Column("wet_race_probability", sa.Float),
-    sa.Column("weather_change_during_race_probability", sa.Float),
-    sa.Column("driver_wet_weather_advantage", sa.Float),
-    sa.Column("team_wet_setup_effectiveness", sa.Float),
-    sa.Column("grid_position_std_dev", sa.Float),
-    sa.Column("expected_race_pace_gaps", sa.Float),
-    sa.Column("competitive_balance_index", sa.Float),
-    sa.Column("active_aero_adaptation_score", sa.Float),
-    sa.Column("overtake_mode_efficiency", sa.Float),
-    sa.Column("new_power_unit_reliability_risk", sa.Float),
-    sa.Column("regulation_adaptation_success", sa.Float),
-    sa.Column("driver_circuit_affinity", sa.Float),
-    sa.Column("car_circuit_compatibility", sa.Float),
-    sa.Column("weather_adjusted_pace", sa.Float),
-    sa.Column("wet_advantage_index", sa.Float),
-    sa.Column("risk_adjusted_strategy", sa.Float),
-    sa.Column("intra_team_competition_factor", sa.Float),
-    sa.Column("team_orders_adjustment", sa.Float),
-    sa.Column("motivational_boost", sa.Float),
-    sa.Column("expected_qualifying_position", sa.Float),
-    sa.Column("expected_race_pace", sa.Float),
-    sa.Column("win_probability_raw", sa.Float),
-    sa.UniqueConstraint("race_id", "driver_id", name="uq_situational_features"),
-)
 
 
 def parse_args() -> argparse.Namespace:
@@ -1030,9 +745,9 @@ def build_circuit_metrics(
         conn,
     )
 
-    results_df = results_df.merge(races_df, on="race_id", how="left")
-    qualifying_df = qualifying_df.merge(races_df, on="race_id", how="left")
-    laps_df = laps_df.merge(races_df, on="race_id", how="left")
+    results_df = results_df.merge(
+        races_df[["race_id", "order_index"]], on="race_id", how="left"
+    )
     pits_df = pits_df.merge(races_df, on="race_id", how="left")
     weather_df = weather_df.merge(races_df, on="race_id", how="left")
     laps_with_driver = laps_df.merge(drivers_df, on="driver_id", how="left")
@@ -1871,13 +1586,37 @@ def update_team_features(engine: Engine, lookback_period: int = 10) -> None:
                 conn.execute(stmt)
 
 
-def extract_race_features(conn: sa.Connection, race_id: int, driver_id: int) -> Dict[str, Any]:
-    races_df = pd.read_sql(
-        sa.select(races.c.race_id, races.c.season, races.c.round, races.c.circuit_name),
-        conn,
+def extract_race_features(
+    conn: sa.Connection,
+    race_id: int,
+    driver_id: int,
+    lookback_races: int = 50,
+) -> Dict[str, Any]:
+    race_row = conn.execute(
+        sa.select(races.c.race_id, races.c.season, races.c.round, races.c.circuit_name).where(
+            races.c.race_id == race_id
+        )
+    ).mappings().first()
+    if not race_row:
+        return {}
+
+    season = race_row["season"]
+    round_number = race_row["round"]
+    race_scope = sa.or_(
+        races.c.season < season,
+        sa.and_(races.c.season == season, races.c.round <= round_number),
     )
-    races_df = races_df.sort_values(["season", "round"]).reset_index(drop=True)
+    races_df = pd.read_sql(
+        sa.select(races.c.race_id, races.c.season, races.c.round, races.c.circuit_name)
+        .where(race_scope)
+        .order_by(races.c.season.desc(), races.c.round.desc())
+        .limit(lookback_races),
+        conn,
+    ).sort_values(["season", "round"]).reset_index(drop=True)
     races_df["order_index"] = range(len(races_df))
+    race_ids = races_df["race_id"].tolist()
+    if not race_ids:
+        return {}
     results_df = pd.read_sql(
         sa.select(
             race_results.c.race_id,
@@ -1887,7 +1626,12 @@ def extract_race_features(conn: sa.Connection, race_id: int, driver_id: int) -> 
             race_results.c.finishing_position,
             race_results.c.points,
             race_results.c.status,
-        ),
+            races.c.season,
+            races.c.round,
+            races.c.circuit_name,
+        )
+        .select_from(race_results.join(races, race_results.c.race_id == races.c.race_id))
+        .where(race_results.c.race_id.in_(race_ids)),
         conn,
     )
     qualifying_df = pd.read_sql(
@@ -1895,7 +1639,7 @@ def extract_race_features(conn: sa.Connection, race_id: int, driver_id: int) -> 
             qualifying_results.c.race_id,
             qualifying_results.c.driver_id,
             qualifying_results.c.grid_position.label("qualifying_position"),
-        ),
+        ).where(qualifying_results.c.race_id == race_id),
         conn,
     )
     laps_df = pd.read_sql(
@@ -1905,7 +1649,16 @@ def extract_race_features(conn: sa.Connection, race_id: int, driver_id: int) -> 
             lap_times.c.lap_number,
             lap_times.c.lap_time,
             lap_times.c.tire_compound,
-        ),
+        ).where(lap_times.c.race_id == race_id),
+        conn,
+    )
+    pit_df = pd.read_sql(
+        sa.select(
+            pit_stops.c.race_id,
+            pit_stops.c.driver_id,
+            pit_stops.c.stop_number,
+            pit_stops.c.duration,
+        ).where(pit_stops.c.race_id == race_id),
         conn,
     )
     weather_df = pd.read_sql(
@@ -1914,9 +1667,13 @@ def extract_race_features(conn: sa.Connection, race_id: int, driver_id: int) -> 
             race_weather.c.conditions,
             race_weather.c.wet_race_probability,
             race_weather.c.weather_change_probability,
-        ),
+        ).where(race_weather.c.race_id == race_id),
         conn,
     )
+    circuits_df = pd.read_sql(
+        sa.select(circuits.c.circuit_name, circuits.c.circuit_type),
+        conn,
+    ).set_index("circuit_name")
     circuit_char_df = pd.read_sql(
         sa.select(
             circuits.c.circuit_id,
@@ -1951,7 +1708,7 @@ def extract_race_features(conn: sa.Connection, race_id: int, driver_id: int) -> 
             team_features.c.strategy_success_rate,
             team_features.c.historical_avg_points_at_circuit,
             team_features.c.dnf_rate_last_10_races,
-        ),
+        ).where(team_features.c.race_id == race_id),
         conn,
     )
     driver_features_df = pd.read_sql(
@@ -1966,16 +1723,12 @@ def extract_race_features(conn: sa.Connection, race_id: int, driver_id: int) -> 
             driver_features.c.tire_management_score,
             driver_features.c.qualifying_pace_percentile,
             driver_features.c.race_pace_percentile,
-        ),
+        ).where(driver_features.c.race_id == race_id),
         conn,
     )
 
-    if race_id not in races_df["race_id"].values:
-        return {}
-    race_row = races_df[races_df["race_id"] == race_id].iloc[0]
-    order_index = race_row["order_index"]
+    order_index = races_df.index[races_df["race_id"] == race_id][0]
     circuit_name = race_row["circuit_name"]
-    season = race_row["season"]
 
     results_df = results_df.merge(races_df, on="race_id", how="left")
     qualifying_df = qualifying_df.merge(races_df, on="race_id", how="left")
@@ -2373,7 +2126,12 @@ def update_situational_features(engine: Engine) -> None:
             conn,
         )
         for _, row in race_driver_pairs.iterrows():
-            features = extract_race_features(conn, int(row["race_id"]), int(row["driver_id"]))
+            features = extract_race_features(
+                conn,
+                int(row["race_id"]),
+                int(row["driver_id"]),
+                lookback_races=50,
+            )
             if not features:
                 continue
             stmt = pg_insert(situational_features).values(

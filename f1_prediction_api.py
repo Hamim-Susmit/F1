@@ -3,15 +3,18 @@ from __future__ import annotations
 import logging
 import os
 import time
+from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 from prometheus_client import Counter, Gauge, Histogram
 from prometheus_client.exposition import generate_latest
 from prometheus_client import CONTENT_TYPE_LATEST
 from pythonjsonlogger import jsonlogger
+from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import Response
+import sqlalchemy as sa
 
 from f1_prediction_pipeline import (
     F1RacePredictor,
@@ -22,6 +25,16 @@ from f1_prediction_pipeline import (
 
 
 app = FastAPI(title="F1 Prediction API", version="1.0")
+
+allowed_origins = [origin.strip() for origin in os.environ.get("ALLOWED_ORIGINS", "*").split(",")]
+allow_credentials = allowed_origins != ["*"]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_origins if allowed_origins != ["*"] else ["*"],
+    allow_credentials=allow_credentials,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 logger = logging.getLogger("f1_api")
 log_handler = logging.StreamHandler()
@@ -71,6 +84,15 @@ class RacePrediction(BaseModel):
     metadata: Dict[str, Any]
 
 
+def verify_api_key(x_api_key: Optional[str] = Header(default=None)) -> None:
+    required_key = os.environ.get("API_KEY")
+    if not required_key:
+        return
+    if x_api_key != required_key:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+
+@lru_cache(maxsize=1)
 def get_predictor() -> F1RacePredictor:
     database_url = os.environ.get("DATABASE_URL")
     model_dir = os.environ.get("MODEL_DIR", "models")
@@ -79,7 +101,24 @@ def get_predictor() -> F1RacePredictor:
     return F1RacePredictor(database_url=database_url, model_dir=model_dir)
 
 
-@app.post("/predict", response_model=RacePrediction)
+def get_engine() -> sa.Engine:
+    database_url = os.environ.get("DATABASE_URL")
+    if not database_url:
+        raise HTTPException(status_code=500, detail="DATABASE_URL must be set")
+    if allowed_origins == ["*"] and os.environ.get("API_KEY"):
+        raise HTTPException(
+            status_code=500,
+            detail="ALLOWED_ORIGINS must be explicit when API_KEY is set",
+        )
+    return sa.create_engine(database_url, future=True)
+
+
+@app.get("/")
+async def root() -> Dict[str, str]:
+    return {"service": "F1 Prediction API", "status": "ok"}
+
+
+@app.post("/predict", response_model=RacePrediction, dependencies=[Depends(verify_api_key)])
 async def predict_race(request: PredictionRequest) -> RacePrediction:
     start_time = time.time()
     try:
@@ -120,7 +159,7 @@ async def predict_race(request: PredictionRequest) -> RacePrediction:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
-@app.get("/races/upcoming")
+@app.get("/races/upcoming", dependencies=[Depends(verify_api_key)])
 async def get_upcoming_races() -> Dict[str, Any]:
     return {
         "races": [
@@ -130,7 +169,7 @@ async def get_upcoming_races() -> Dict[str, Any]:
     }
 
 
-@app.get("/model/performance")
+@app.get("/model/performance", dependencies=[Depends(verify_api_key)])
 async def get_model_performance() -> Dict[str, Any]:
     evaluator = ModelEvaluator()
     report = evaluator.generate_report(season=2026)
@@ -150,7 +189,7 @@ async def metrics() -> Response:
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
-@app.post("/scenarios/simulate")
+@app.post("/scenarios/simulate", dependencies=[Depends(verify_api_key)])
 async def simulate_scenarios(race_id: int, scenarios: List[str]) -> Dict[str, Any]:
     predictor = get_predictor()
     simulator = ScenarioSimulator(predictor)
@@ -161,10 +200,28 @@ async def simulate_scenarios(race_id: int, scenarios: List[str]) -> Dict[str, An
     return comparison
 
 
-@app.post("/update/qualifying")
+@app.post("/update/qualifying", dependencies=[Depends(verify_api_key)])
 async def update_from_qualifying(
     race_id: int, quali_results: Dict[int, int]
 ) -> Dict[str, Any]:
     predictor = get_predictor()
     updater = LivePredictionUpdater(predictor)
     return updater.update_from_qualifying(race_id, quali_results)
+
+
+@app.get("/drivers", dependencies=[Depends(verify_api_key)])
+async def list_drivers() -> Dict[str, Any]:
+    engine = get_engine()
+    query = sa.text("SELECT driver_id, full_name, nationality FROM drivers ORDER BY full_name")
+    with engine.begin() as conn:
+        rows = conn.execute(query).mappings().all()
+    return {"drivers": [dict(row) for row in rows]}
+
+
+@app.get("/teams", dependencies=[Depends(verify_api_key)])
+async def list_teams() -> Dict[str, Any]:
+    engine = get_engine()
+    query = sa.text("SELECT team_id, team_name, engine_manufacturer FROM teams ORDER BY team_name")
+    with engine.begin() as conn:
+        rows = conn.execute(query).mappings().all()
+    return {"teams": [dict(row) for row in rows]}
