@@ -95,16 +95,12 @@ qualifying_results = sa.Table(
 lap_times = sa.Table(
     "lap_times",
     metadata,
-    pit_stops,
-    predictions,
-    qualifying_results,
-    race_results,
-    race_weather,
-    race_weather_forecasts,
-    races,
-    situational_features,
-    team_features,
-    teams,
+    sa.Column("lap_id", sa.Integer, primary_key=True),
+    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
+    sa.Column("driver_id", sa.Integer, sa.ForeignKey("drivers.driver_id"), nullable=False),
+    sa.Column("lap_number", sa.Integer, nullable=False),
+    sa.Column("lap_time", sa.Float),
+    sa.Column("tire_compound", sa.String),
 )
 
 
