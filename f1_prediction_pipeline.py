@@ -43,6 +43,7 @@ class F1RacePredictor:
             raise ValueError("DATABASE_URL is required")
         self.engine = sa.create_engine(database_url, future=True)
         self.model_dir = model_dir
+        self.missing_models: List[str] = []
         self.models = {
             "xgb_position": self._load_joblib("xgb_position.joblib"),
             "lgb_position": self._load_optional_joblib("lgb_position.joblib"),
@@ -130,6 +131,9 @@ class F1RacePredictor:
 
     def get_race_info(self, race_id: int | str) -> Dict[str, Any]:
         race_id = self.normalize_race_id(race_id)
+        if self.missing_models:
+            missing = ", ".join(sorted(self.missing_models))
+            raise RuntimeError(f"Missing required model artifacts: {missing}")
         query = sa.text(
             """
             SELECT race_id, season, round, race_name, circuit_name, race_date
