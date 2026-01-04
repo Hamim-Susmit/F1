@@ -548,16 +548,23 @@ class ScenarioSimulator:
     def __init__(self, predictor: F1RacePredictor) -> None:
         self.predictor = predictor
 
-    def simulate_weather_scenarios(self, race_id: int | str) -> Dict[str, Any]:
+    def simulate_weather_scenarios(
+        self, race_id: int | str, scenarios: List[str] | None = None
+    ) -> Dict[str, Any]:
         race_id = self.predictor.normalize_race_id(race_id)
-        scenarios = {
+        scenario_map = {
             "dry": {"rain_probability": 0.0, "temp": 25},
             "mixed": {"rain_probability": 0.3, "temp": 22},
             "wet": {"rain_probability": 0.8, "temp": 18},
             "very_wet": {"rain_probability": 1.0, "temp": 16},
         }
+        if scenarios:
+            unknown = sorted(set(scenarios) - set(scenario_map))
+            if unknown:
+                raise ValueError(f"Unknown scenarios requested: {', '.join(unknown)}")
+            scenario_map = {name: scenario_map[name] for name in scenarios}
         results = {}
-        for scenario_name, weather in scenarios.items():
+        for scenario_name, weather in scenario_map.items():
             pred = self.predictor.predict_race(race_id, weather_override=weather)
             results[scenario_name] = pred["predictions"]
         return self.compare_scenarios(results)
