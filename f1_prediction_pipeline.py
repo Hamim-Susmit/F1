@@ -43,19 +43,41 @@ class F1RacePredictor:
             raise ValueError("DATABASE_URL is required")
         self.engine = sa.create_engine(database_url, future=True)
         self.model_dir = model_dir
+        self.missing_models: List[str] = []
         self.models = {
-            "xgb_position": joblib.load(os.path.join(model_dir, "xgb_position.joblib")),
-            "lgb_time": joblib.load(os.path.join(model_dir, "lgb_time.joblib")),
-            "rf_position": joblib.load(os.path.join(model_dir, "rf_position.joblib")),
-            "nn_position": keras.models.load_model(os.path.join(model_dir, "nn_position.keras")),
-            "xgb_dnf": joblib.load(os.path.join(model_dir, "xgb_dnf.joblib")),
-            "xgb_podium": joblib.load(os.path.join(model_dir, "xgb_podium.joblib")),
+            "xgb_position": self._load_required_joblib("xgb_position.joblib"),
+            "lgb_position": self._load_optional_joblib("lgb_position.joblib"),
+            "lgb_time": self._load_required_joblib("lgb_time.joblib"),
+            "rf_position": self._load_required_joblib("rf_position.joblib"),
+            "nn_position": self._load_required_keras("nn_position.keras"),
+            "xgb_dnf": self._load_required_joblib("xgb_dnf.joblib"),
+            "xgb_podium": self._load_required_joblib("xgb_podium.joblib"),
         }
         self.feature_extractor = FeatureExtractor(self.engine)
         self.weather_override: Dict[str, Any] | None = None
         self.grid_overrides: Dict[int, int] = {}
         self.team_performance_overrides: Dict[str, float] = {}
         self.dnf_overrides: set[int] = set()
+
+    def _load_required_joblib(self, filename: str):
+        path = os.path.join(self.model_dir, filename)
+        if not os.path.exists(path):
+            self.missing_models.append(filename)
+            return None
+        return joblib.load(path)
+
+    def _load_optional_joblib(self, filename: str):
+        path = os.path.join(self.model_dir, filename)
+        if not os.path.exists(path):
+            return None
+        return joblib.load(path)
+
+    def _load_required_keras(self, filename: str):
+        path = os.path.join(self.model_dir, filename)
+        if not os.path.exists(path):
+            self.missing_models.append(filename)
+            return None
+        return keras.models.load_model(path)
 
     def set_weather_scenario(self, scenario: str | None) -> None:
         if scenario is None:
@@ -111,6 +133,9 @@ class F1RacePredictor:
 
     def get_race_info(self, race_id: int | str) -> Dict[str, Any]:
         race_id = self.normalize_race_id(race_id)
+        if self.missing_models:
+            missing = ", ".join(sorted(self.missing_models))
+            raise RuntimeError(f"Missing required model artifacts: {missing}")
         query = sa.text(
             """
             SELECT race_id, season, round, race_name, circuit_name, race_date
@@ -246,6 +271,9 @@ class F1RacePredictor:
 
         predictions = {
             "position": self.models["xgb_position"].predict(X),
+            "lgb_position": self.models["lgb_position"].predict(X)
+            if self.models.get("lgb_position") is not None
+            else None,
             "time": self.models["lgb_time"].predict(X),
             "dnf_probability": self.models["xgb_dnf"].predict_proba(X)[:, 1],
             "podium_probability": self.models["xgb_podium"].predict_proba(X),
@@ -257,11 +285,16 @@ class F1RacePredictor:
                 if driver["driver_id"] in self.dnf_overrides:
                     predictions["dnf_probability"][idx] = 1.0
 
+        lgb_position = (
+            predictions["lgb_position"]
+            if predictions["lgb_position"] is not None
+            else predictions["position"]
+        )
         final_position = (
             predictions["position"] * 0.35
             + predictions["rf_position"] * 0.30
             + predictions["nn_position"] * 0.25
-            + predictions["position"] * 0.10
+            + lgb_position * 0.10
         )
 
         final_position = self.resolve_position_conflicts(final_position)
@@ -318,13 +351,14 @@ class F1RacePredictor:
         return np.array([assigned[i] for i in range(len(predictions))])
 
     def calculate_confidence(self, predictions: Dict[str, np.ndarray]) -> np.ndarray:
-        position_preds = np.column_stack(
-            [
-                predictions["position"],
-                predictions["rf_position"],
-                predictions["nn_position"],
-            ]
-        )
+        components = [
+            predictions["position"],
+            predictions["rf_position"],
+            predictions["nn_position"],
+        ]
+        if predictions.get("lgb_position") is not None:
+            components.append(predictions["lgb_position"])
+        position_preds = np.column_stack(components)
         model_agreement = 1 / (1 + np.std(position_preds, axis=1))
         return model_agreement / model_agreement.max() * 100
 
@@ -350,6 +384,7 @@ class F1RacePredictor:
         versions = {}
         for name, filename in {
             "xgb_position": "xgb_position.joblib",
+            "lgb_position": "lgb_position.joblib",
             "lgb_time": "lgb_time.joblib",
             "rf_position": "rf_position.joblib",
             "nn_position": "nn_position.keras",
