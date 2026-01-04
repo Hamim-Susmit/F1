@@ -22,6 +22,7 @@ from f1_data_ingest import extract_race_features
 class FeatureExtractor:
     def __init__(self, engine: sa.Engine) -> None:
         self.engine = engine
+        self._cache: Dict[tuple[int, int, int], Dict[str, Any]] = {}
 
     def extract(
         self,
@@ -29,9 +30,20 @@ class FeatureExtractor:
         race_id: int,
         grid_position: int | None = None,
         use_latest_data: bool = True,
+        lookback_races: int = 50,
     ) -> Dict[str, Any]:
-        with self.engine.begin() as conn:
-            features = extract_race_features(conn, race_id=race_id, driver_id=driver_id)
+        cache_key = (race_id, driver_id, lookback_races)
+        if cache_key in self._cache:
+            features = dict(self._cache[cache_key])
+        else:
+            with self.engine.begin() as conn:
+                features = extract_race_features(
+                    conn,
+                    race_id=race_id,
+                    driver_id=driver_id,
+                    lookback_races=lookback_races,
+                )
+            self._cache[cache_key] = dict(features)
         if grid_position is not None:
             features["grid_position"] = grid_position
         return features
@@ -53,6 +65,9 @@ class F1RacePredictor:
             "xgb_dnf": self._load_joblib("xgb_dnf.joblib"),
             "xgb_podium": self._load_joblib("xgb_podium.joblib"),
         }
+        if self.missing_models:
+            missing = ", ".join(sorted(self.missing_models))
+            raise RuntimeError(f"Missing required model artifacts: {missing}")
         self.feature_extractor = FeatureExtractor(self.engine)
         self.weather_override: Dict[str, Any] | None = None
         self.grid_overrides: Dict[int, int] = {}
@@ -231,6 +246,7 @@ class F1RacePredictor:
         race_id: int | str,
         use_latest_data: bool = True,
         weather_override: Dict[str, Any] | None = None,
+        lookback_races: int = 50,
     ) -> Dict[str, Any]:
         race_id = self.normalize_race_id(race_id)
         race_info = self.get_race_info(race_id)
@@ -251,6 +267,7 @@ class F1RacePredictor:
                 race_id=race_id,
                 grid_position=grid_position,
                 use_latest_data=use_latest_data,
+                lookback_races=lookback_races,
             )
             driver_features.append(features)
 

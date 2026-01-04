@@ -1682,6 +1682,9 @@ def extract_race_features(conn: sa.Connection, race_id: int, driver_id: int) -> 
     )
     races_df = races_df.reset_index(drop=True)
     races_df["order_index"] = range(len(races_df))
+    race_ids = races_df["race_id"].tolist()
+    if not race_ids:
+        return {}
     results_df = pd.read_sql(
         sa.select(
             race_results.c.race_id,
@@ -2191,7 +2194,12 @@ def update_situational_features(engine: Engine) -> None:
             conn,
         )
         for _, row in race_driver_pairs.iterrows():
-            features = extract_race_features(conn, int(row["race_id"]), int(row["driver_id"]))
+            features = extract_race_features(
+                conn,
+                int(row["race_id"]),
+                int(row["driver_id"]),
+                lookback_races=50,
+            )
             if not features:
                 continue
             stmt = pg_insert(situational_features).values(
