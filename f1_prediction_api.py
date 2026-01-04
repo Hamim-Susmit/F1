@@ -187,11 +187,7 @@ async def metrics() -> Response:
 async def simulate_scenarios(race_id: int, scenarios: List[str]) -> Dict[str, Any]:
     predictor = get_predictor()
     simulator = ScenarioSimulator(predictor)
-    if scenarios:
-        predictor.set_weather_scenario(scenarios[0])
-    comparison = simulator.simulate_weather_scenarios(race_id)
-    predictor.set_weather_scenario(None)
-    return comparison
+    return simulator.simulate_weather_scenarios(race_id, scenarios or None)
 
 
 @app.post("/update/qualifying", dependencies=[Depends(verify_api_key)])
