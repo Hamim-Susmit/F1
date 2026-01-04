@@ -14,10 +14,6 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import Engine
 from tqdm import tqdm
 
-
-LOG = logging.getLogger("f1_ingest")
-
-
 metadata = sa.MetaData()
 
 races = sa.Table(
@@ -95,16 +91,165 @@ qualifying_results = sa.Table(
 lap_times = sa.Table(
     "lap_times",
     metadata,
-    pit_stops,
-    predictions,
-    qualifying_results,
-    race_results,
-    race_weather,
-    race_weather_forecasts,
-    races,
-    situational_features,
-    team_features,
-    teams,
+    sa.Column("lap_id", sa.Integer, primary_key=True),
+    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
+    sa.Column("driver_id", sa.Integer, sa.ForeignKey("drivers.driver_id"), nullable=False),
+    sa.Column("lap_number", sa.Integer, nullable=False),
+    sa.Column("lap_time", sa.Float),
+    sa.Column("tire_compound", sa.String),
+)
+
+pit_stops = sa.Table(
+    "pit_stops",
+    metadata,
+    sa.Column("stop_id", sa.Integer, primary_key=True),
+    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
+    sa.Column("driver_id", sa.Integer, sa.ForeignKey("drivers.driver_id"), nullable=False),
+    sa.Column("stop_number", sa.Integer, nullable=False),
+    sa.Column("lap", sa.Integer, nullable=False),
+    sa.Column("duration", sa.Float),
+    sa.Column("tire_in", sa.String),
+    sa.Column("tire_out", sa.String),
+)
+
+race_weather = sa.Table(
+    "race_weather",
+    metadata,
+    sa.Column("weather_id", sa.Integer, primary_key=True),
+    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
+    sa.Column("session_type", sa.String, nullable=False),
+    sa.Column("air_temp", sa.Float),
+    sa.Column("track_temp", sa.Float),
+    sa.Column("rain_probability", sa.Float),
+    sa.Column("rain_amount", sa.Float),
+    sa.Column("humidity", sa.Float),
+    sa.Column("wind_speed", sa.Float),
+    sa.Column("wind_direction", sa.Float),
+    sa.Column("conditions", sa.String),
+    sa.Column("wet_race_probability", sa.Float),
+    sa.Column("temp_deviation", sa.Float),
+    sa.Column("weather_change_probability", sa.Float),
+    sa.Column("is_estimated", sa.Boolean, default=False),
+    sa.Column("source", sa.String),
+)
+
+race_weather_forecasts = sa.Table(
+    "race_weather_forecasts",
+    metadata,
+    sa.Column("forecast_id", sa.Integer, primary_key=True),
+    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
+    sa.Column("session_type", sa.String, nullable=False),
+    sa.Column("forecast_time", sa.DateTime(timezone=True), nullable=False),
+    sa.Column("air_temp", sa.Float),
+    sa.Column("track_temp", sa.Float),
+    sa.Column("rain_probability", sa.Float),
+    sa.Column("rain_amount", sa.Float),
+    sa.Column("humidity", sa.Float),
+    sa.Column("wind_speed", sa.Float),
+    sa.Column("wind_direction", sa.Float),
+    sa.Column("conditions", sa.String),
+    sa.Column("source", sa.String),
+)
+
+circuits = sa.Table(
+    "circuits",
+    metadata,
+    sa.Column("circuit_id", sa.Integer, primary_key=True),
+    sa.Column("circuit_name", sa.String, nullable=False, unique=True),
+    sa.Column("country", sa.String),
+    sa.Column("circuit_length", sa.Float),
+    sa.Column("number_of_corners", sa.Integer),
+    sa.Column("longest_straight", sa.Float),
+    sa.Column("circuit_type", sa.String),
+    sa.Column("altitude", sa.Integer),
+    sa.Column("lap_record", sa.Float),
+    sa.Column("lap_record_holder", sa.String),
+    sa.Column("lap_record_year", sa.Integer),
+)
+
+circuit_characteristics = sa.Table(
+    "circuit_characteristics",
+    metadata,
+    sa.Column("char_id", sa.Integer, primary_key=True),
+    sa.Column("circuit_id", sa.Integer, sa.ForeignKey("circuits.circuit_id"), nullable=False),
+    sa.Column("high_speed_corners", sa.Integer),
+    sa.Column("medium_speed_corners", sa.Integer),
+    sa.Column("low_speed_corners", sa.Integer),
+    sa.Column("overtaking_difficulty", sa.Integer),
+    sa.Column("drs_zones", sa.Integer),
+    sa.Column("pit_lane_time_loss", sa.Float),
+    sa.Column("track_evolution_factor", sa.Float),
+    sa.Column("safety_car_probability", sa.Float),
+    sa.Column("average_pit_stops", sa.Float),
+    sa.Column("typical_strategy", sa.String),
+    sa.Column("overtaking_frequency", sa.Float),
+    sa.Column("grid_finish_correlation", sa.Float),
+    sa.Column("qualifying_importance", sa.Float),
+    sa.Column("tire_degradation_severity", sa.Float),
+    sa.Column("strategy_variation", sa.Float),
+    sa.UniqueConstraint("circuit_id", name="circuit_characteristics_circuit_id_key"),
+)
+
+circuit_history = sa.Table(
+    "circuit_history",
+    metadata,
+    sa.Column("history_id", sa.Integer, primary_key=True),
+    sa.Column("circuit_id", sa.Integer, sa.ForeignKey("circuits.circuit_id"), nullable=False),
+    sa.Column("season", sa.Integer, nullable=False),
+    sa.Column("pole_win_rate", sa.Float),
+    sa.Column("average_winning_margin", sa.Float),
+    sa.Column("safety_car_frequency", sa.Float),
+    sa.Column("red_flag_count", sa.Integer),
+    sa.Column("weather_variability", sa.Float),
+    sa.UniqueConstraint("circuit_id", "season", name="uq_circuit_history"),
+)
+
+driver_features = sa.Table(
+    "driver_features",
+    metadata,
+    sa.Column("feature_id", sa.Integer, primary_key=True),
+    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
+    sa.Column("driver_id", sa.Integer, sa.ForeignKey("drivers.driver_id"), nullable=False),
+    sa.Column("recent_dnf_rate", sa.Float),
+    sa.Column("wet_weather_performance_multiplier", sa.Float),
+    sa.Column("avg_finish_position_at_circuit", sa.Float),
+    sa.Column("last_3_races_avg_position", sa.Float),
+    sa.Column("overtaking_success_rate", sa.Float),
+    sa.Column("tire_management_score", sa.Float),
+    sa.Column("qualifying_pace_percentile", sa.Float),
+    sa.Column("race_pace_percentile", sa.Float),
+    sa.UniqueConstraint("race_id", "driver_id", name="uq_driver_features"),
+)
+
+team_features = sa.Table(
+    "team_features",
+    metadata,
+    sa.Column("feature_id", sa.Integer, primary_key=True),
+    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
+    sa.Column("team_id", sa.Integer, sa.ForeignKey("teams.team_id"), nullable=False),
+    sa.Column("momentum_score", sa.Float),
+    sa.Column("performance_trend_last_5_races", sa.Float),
+    sa.Column("straight_line_speed_ranking", sa.Float),
+    sa.Column("overall_downforce_level", sa.Float),
+    sa.Column("strategy_success_rate", sa.Float),
+    sa.Column("historical_avg_points_at_circuit", sa.Float),
+    sa.Column("dnf_rate_last_10_races", sa.Float),
+    sa.UniqueConstraint("race_id", "team_id", name="uq_team_features"),
+)
+
+situational_features = sa.Table(
+    "situational_features",
+    metadata,
+    sa.Column("feature_id", sa.Integer, primary_key=True),
+    sa.Column("race_id", sa.Integer, sa.ForeignKey("races.race_id"), nullable=False),
+    sa.Column("driver_id", sa.Integer, sa.ForeignKey("drivers.driver_id"), nullable=False),
+    sa.Column("grid_position", sa.Integer),
+    sa.Column("track_position_variance", sa.Float),
+    sa.Column("safety_car_impact_score", sa.Float),
+    sa.Column("pit_window_optimization_score", sa.Float),
+    sa.Column("strategy_variability_index", sa.Float),
+    sa.Column("session_completion_rate", sa.Float),
+    sa.UniqueConstraint("race_id", "driver_id", name="uq_situational_features"),
 )
 
 
