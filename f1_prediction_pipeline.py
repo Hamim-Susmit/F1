@@ -400,7 +400,9 @@ class LivePredictionUpdater:
         race_id = self.predictor.normalize_race_id(race_id)
         current = self.cache.get(race_id)
         if current is None:
-            updated = self.predictor.predict_race(race_id)
+            updated = self.predictor.predict_race(
+                race_id, use_latest_data=True, weather_override=new_forecast
+            )
             self.cache[race_id] = updated
             return updated
         old_rain_prob = current["metadata"].get("weather_forecast", {}).get("rain_probability")
@@ -408,7 +410,9 @@ class LivePredictionUpdater:
         if old_rain_prob is None or new_rain_prob is None:
             return current
         if abs(new_rain_prob - old_rain_prob) > 0.15:
-            updated = self.predictor.predict_race(race_id, use_latest_data=True)
+            updated = self.predictor.predict_race(
+                race_id, use_latest_data=True, weather_override=new_forecast
+            )
             self.cache[race_id] = updated
             return updated
         return current
